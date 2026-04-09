@@ -1,3 +1,5 @@
+#![allow(dead_code)] // will be wired to UI once sync engine is implemented
+
 /// Outlook calendar access via Extended MAPI.
 ///
 /// # Threading
@@ -7,6 +9,8 @@
 pub mod calendar;
 pub mod props;
 pub mod session;
+
+pub use calendar::OutlookCalendar;
 
 use std::mem::ManuallyDrop;
 
@@ -32,6 +36,25 @@ pub const DEFAULT_FUTURE_DAYS: i64 = 183;
 // TODO: read from registry at startup
 const MAPI_DLL_PATH: &str =
     "C:\\Program Files\\Microsoft Office\\root\\VFS\\ProgramFilesCommonX64\\system\\msmapi\\1031\\msmapi32.dll";
+
+/// List all Outlook message stores available in the default profile.
+///
+/// Spawns a dedicated MAPI thread and returns the results. Use the returned
+/// display names to populate a calendar picker; the selected index maps back
+/// to the same list for later store identification.
+pub fn list_calendar_sources() -> Result<Vec<OutlookCalendar>, MapiError> {
+    std::thread::spawn(move || {
+        unsafe { CoInitialize(None) }.ok().map_err(|e| MapiError(e.code().0 as u32))?;
+        let result = unsafe {
+            let session = session::Session::new(MAPI_DLL_PATH)?;
+            calendar::list_calendar_stores(session.as_ptr())
+        };
+        unsafe { CoUninitialize() };
+        result
+    })
+    .join()
+    .map_err(|_| MapiError(0x80040106))?
+}
 
 /// Read all calendar events that fall within the given sync window.
 ///

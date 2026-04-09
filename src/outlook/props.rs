@@ -31,6 +31,7 @@ pub const PR_ENTRYID: u32             = 0x0FFF0102;
 pub const PR_DEFAULT_STORE: u32       = 0x3400000B;
 pub const PR_IPM_SUBTREE_ENTRYID: u32 = 0x35E00102;
 pub const PR_DISPLAY_NAME: u32        = 0x3001001E;
+pub const PR_DISPLAY_NAME_W: u32      = 0x3001001F;
 pub const PR_CONTAINER_CLASS: u32     = 0x3613001E;
 pub const PR_SUBJECT: u32             = 0x0037001E;
 pub const PR_START_DATE: u32          = 0x00600040;
