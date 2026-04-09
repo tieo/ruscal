@@ -32,9 +32,9 @@ use windows::Win32::System::AddressBook::{
 use super::props::{
     self, build_tag_array, datetime_to_filetime, read_binary, read_bool,
     read_filetime, read_long, read_str8, read_unicode,
-    NamedProps, PR_BODY, PR_CONTAINER_CLASS, PR_DISPLAY_NAME, PR_END_DATE,
-    PR_ENTRYID, PR_IPM_SUBTREE_ENTRYID, PR_SENDER_NAME, PR_SENDER_SMTP_ADDRESS,
-    PR_SENSITIVITY, PR_START_DATE, PR_SUBJECT,
+    NamedProps, PR_BODY, PR_CONTAINER_CLASS, PR_DISPLAY_NAME, PR_DISPLAY_NAME_W,
+    PR_END_DATE, PR_ENTRYID, PR_IPM_SUBTREE_ENTRYID, PR_SENDER_NAME,
+    PR_SENDER_SMTP_ADDRESS, PR_SENSITIVITY, PR_START_DATE, PR_SUBJECT,
 };
 use super::session::IMAPISession;
 use crate::error::{check_hr, MapiError};
@@ -48,6 +48,68 @@ const RES_PROPERTY: u32 = 0x0000_0004;
 const RELOP_GE:     u32 = 0x0000_0003; // >=
 const RELOP_LE:     u32 = 0x0000_0001; // <=
 const RELOP_EQ:     u32 = 0x0000_0004; // ==
+
+// ── Calendar source listing ───────────────────────────────────────────────────
+
+/// An Outlook message store that contains a Calendar folder.
+pub struct OutlookCalendar {
+    /// Display name shown in the picker (usually the account e-mail address).
+    pub display_name: String,
+}
+
+/// List all message stores visible in the current MAPI session.
+///
+/// Returns one entry per store that has a non-empty display name. The caller
+/// typically shows this list in a picker and uses the chosen index to identify
+/// the store when opening it for sync.
+///
+/// # Safety
+/// Must be called from the MAPI thread.
+pub unsafe fn list_calendar_stores(
+    session_ptr: *mut IMAPISession,
+) -> Result<Vec<OutlookCalendar>, MapiError> {
+    let mut raw_table: *mut core::ffi::c_void = core::ptr::null_mut();
+    check_hr(unsafe {
+        ((*(*session_ptr).vtbl).get_msg_stores_table)(session_ptr as *mut _, 0, &mut raw_table)
+    })?;
+
+    let table = ManuallyDrop::new(unsafe {
+        core::mem::transmute::<_, windows::Win32::System::AddressBook::IMAPITable>(raw_table)
+    });
+
+    let mut cols = build_tag_array(&[PR_ENTRYID, PR_DISPLAY_NAME_W]);
+    let mut rows: *mut SRowSet = core::ptr::null_mut();
+    unsafe {
+        HrQueryAllRows(
+            &*table,
+            cols.as_mut_ptr() as *mut SPropTagArray,
+            core::ptr::null_mut(), core::ptr::null_mut(), 0,
+            &mut rows,
+        ).map_err(|e| MapiError(e.code().0 as u32))?;
+    }
+
+    let mut calendars = Vec::new();
+    for i in 0..unsafe { (*rows).cRows } as usize {
+        let row = unsafe { &*(*rows).aRow.as_ptr().add(i) };
+        if row.lpProps.is_null() || row.cValues < 2 { continue; }
+        let p = unsafe { std::slice::from_raw_parts(row.lpProps, row.cValues as usize) };
+        // Prefer Unicode; fall back to ANSI if the provider returned PT_STRING8.
+        let name = unsafe {
+            if p[1].ulPropTag == PR_DISPLAY_NAME_W {
+                read_unicode(&p[1], PR_DISPLAY_NAME_W, "")
+            } else {
+                read_str8(&p[1], PR_DISPLAY_NAME, "")
+            }
+        };
+        if !name.is_empty() {
+            calendars.push(OutlookCalendar { display_name: name });
+        }
+    }
+
+    unsafe { FreeProws(rows) };
+    drop(ManuallyDrop::into_inner(table));
+    Ok(calendars)
+}
 
 // ── Store opening ─────────────────────────────────────────────────────────────
 

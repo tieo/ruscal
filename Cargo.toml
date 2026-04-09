@@ -9,6 +9,8 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_AddressBook",
     "Win32_System_Mapi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
 ] }
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
@@ -20,3 +22,16 @@ toml = "0.8"
 dirs = "5"
 libloading = "0.8"
 hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+sha2 = "0.10"
+rand = "0.8"
+open = "5"
+dotenvy = "0.15"
+roxmltree = "0.20"
+resvg = "0.44"
+slint = { version = "1", features = ["live-preview"] }
+tray-icon = "0.21"
+muda = "0.15"
+
+[build-dependencies]
+slint-build = "1"

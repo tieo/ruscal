@@ -1,0 +1,740 @@
+import { ScrollView } from "std-widgets.slint";
+
+// ── Design tokens ─────────────────────────────────────────────────────────────
+
+global Theme {
+    out property <color> background:       #1c1c1e;
+    out property <color> surface:          #2c2c2e;
+    out property <color> surface-elevated: #3a3a3c;
+    out property <color> border:           #3a3a3c;
+    out property <color> accent:           #0a84ff;
+    out property <color> accent-dim:       #0a84ff18;
+    out property <color> success:          #30d158;
+    out property <color> warning:          #ffd60a;
+    out property <color> error:            #ff453a;
+    out property <color> text-primary:     #f2f2f7;
+    out property <color> text-secondary:   #ebebf5aa;
+    out property <color> text-tertiary:    #ebebf544;
+    out property <color> outlook-color:    #0072c6;
+    out property <color> google-color:     #4285f4;
+}
+
+// ── Data types ────────────────────────────────────────────────────────────────
+
+export enum SyncStatus { Idle, Syncing, Success, Error }
+
+export enum SyncedItemStatus { Ok, Conflict, Error, Skipped }
+
+export struct SyncedItem {
+    subject:  string,
+    status:   SyncedItemStatus,
+    time-ago: string,
+}
+
+export struct SyncPair {
+    source-name:    string,
+    source-account: string,
+    source-color:   color,
+    dest-name:      string,
+    dest-account:   string,
+    dest-color:     color,
+}
+
+// ── Sync indicator ────────────────────────────────────────────────────────────
+
+component SyncIndicator {
+    in property <SyncStatus> status;
+    callback clicked;
+
+    width: 20px;
+    height: 20px;
+
+    property <angle> hover-angle: t.has-hover && status != SyncStatus.Syncing ? 30deg : 0deg;
+    animate hover-angle { duration: 200ms; easing: ease-out; }
+
+    Image {
+        width: 20px; height: 20px;
+        source: @image-url("../assets/sync.svg");
+        image-fit: contain;
+        colorize: status == SyncStatus.Error                    ? Theme.error
+                : (status == SyncStatus.Syncing || t.has-hover) ? Theme.accent
+                : Theme.text-tertiary;
+        animate colorize { duration: 150ms; }
+        transform-rotation: status == SyncStatus.Syncing
+            ? animation-tick() / 900ms * 360deg
+            : hover-angle;
+        transform-origin: { x: 10px, y: 10px };
+    }
+
+    Rectangle {
+        width: 6px; height: 6px;
+        border-radius: 3px;
+        background: Theme.success;
+        x: (parent.width  - self.width)  / 2;
+        y: (parent.height - self.height) / 2;
+        visible: status == SyncStatus.Success && !t.has-hover;
+    }
+
+    t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// ── SVG icon button ───────────────────────────────────────────────────────────
+
+component SvgIconBtn {
+    in property <image>  icon;
+    in property <length> icon-size:  20px;
+    in property <color>  idle-color: Theme.text-secondary;
+    in property <color>  hot-color:  Theme.text-primary;
+    in property <color>  hot-bg:     Theme.surface-elevated;
+    callback clicked;
+
+    width: 38px;
+    height: 38px;
+
+    Rectangle {
+        border-radius: 8px;
+        background: t.has-hover ? root.hot-bg : transparent;
+        animate background { duration: 100ms; }
+
+        Image {
+            width: root.icon-size;
+            height: root.icon-size;
+            source: root.icon;
+            image-fit: contain;
+            colorize: t.has-hover ? root.hot-color : root.idle-color;
+            animate colorize { duration: 100ms; }
+        }
+    }
+
+    t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// ── Single sync pair row ──────────────────────────────────────────────────────
+
+component PairRow {
+    in property <SyncPair> pair;
+    callback configure-source();
+    callback configure-dest();
+
+    HorizontalLayout {
+        spacing: 12px;
+
+        // Source
+        Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 10px;
+            background: pair.source-name != ""
+                ? pair.source-color.with-alpha(src-t.has-hover ? 0.18 : 0.10)
+                : (src-t.has-hover ? Theme.surface-elevated : Theme.surface);
+            animate background { duration: 100ms; }
+            clip: true;
+
+            if pair.source-name == "": VerticalLayout {
+                alignment: center;
+                padding: 8px;
+                Text {
+                    text: "+";
+                    color: src-t.has-hover ? Theme.accent : Theme.text-tertiary;
+                    font-size: 22px; font-weight: 300;
+                    horizontal-alignment: center;
+                    animate color { duration: 100ms; }
+                }
+            }
+
+            if pair.source-name != "": HorizontalLayout {
+                padding-top: 8px; padding-bottom: 8px;
+                padding-left: 12px; padding-right: 10px;
+                spacing: 10px;
+                Rectangle {
+                    width: 28px;
+                    Image {
+                        source: @image-url("../assets/outlook.svg");
+                        width: 28px; height: 28px;
+                        image-fit: contain;
+                        colorize: pair.source-color;
+                        y: (parent.height - self.height) / 2;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: pair.source-name;
+                        color: pair.source-color;
+                        font-size: 13px; font-weight: 600;
+                        overflow: elide;
+                    }
+                    if pair.source-account != "": Text {
+                        text: pair.source-account;
+                        color: Theme.text-tertiary;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            if pair.source-name != "": Rectangle {
+                x: 0px; y: 0px;
+                width: 4px; height: parent.height;
+                background: pair.source-color;
+            }
+
+            src-t := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.configure-source(); }
+            }
+        }
+
+        // Arrow
+        Rectangle {
+            width: 24px;
+            Image {
+                source: @image-url("../assets/arrow-right.svg");
+                width: 16px; height: 16px;
+                image-fit: contain;
+                colorize: Theme.text-tertiary;
+                x: (parent.width  - self.width)  / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        // Destination
+        Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 10px;
+            background: pair.dest-name != ""
+                ? pair.dest-color.with-alpha(dst-t.has-hover ? 0.18 : 0.10)
+                : (dst-t.has-hover ? Theme.surface-elevated : Theme.surface);
+            animate background { duration: 100ms; }
+            clip: true;
+
+            if pair.dest-name == "": VerticalLayout {
+                alignment: center;
+                padding: 8px;
+                Text {
+                    text: "+";
+                    color: dst-t.has-hover ? Theme.accent : Theme.text-tertiary;
+                    font-size: 22px; font-weight: 300;
+                    horizontal-alignment: center;
+                    animate color { duration: 100ms; }
+                }
+            }
+
+            if pair.dest-name != "": HorizontalLayout {
+                padding-top: 8px; padding-bottom: 8px;
+                padding-left: 12px; padding-right: 10px;
+                spacing: 10px;
+                Rectangle {
+                    width: 28px;
+                    Image {
+                        source: @image-url("../assets/gcal.svg");
+                        width: 28px; height: 28px;
+                        image-fit: contain;
+                        y: (parent.height - self.height) / 2;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: pair.dest-name;
+                        color: pair.dest-color;
+                        font-size: 13px; font-weight: 600;
+                        overflow: elide;
+                    }
+                    if pair.dest-account != "": Text {
+                        text: pair.dest-account;
+                        color: Theme.text-tertiary;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            if pair.dest-name != "": Rectangle {
+                x: 0px; y: 0px;
+                width: 4px; height: parent.height;
+                background: pair.dest-color;
+            }
+
+            dst-t := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.configure-dest(); }
+            }
+        }
+    }
+}
+
+// ── Main panel ────────────────────────────────────────────────────────────────
+
+export component TrayPanel inherits Window {
+    title: "ruscal";
+    width: 480px;
+    min-height: 360px;
+    no-frame: true;
+    background: transparent;
+    always-on-top: true;
+
+    callback sync-now();
+    callback configure-source(int);
+    callback configure-dest(int);
+    callback add-pair();
+    callback open-settings();
+    callback minimize();
+    callback quit();
+
+    property <bool> show-quit-dialog: false;
+
+    in property <SyncStatus>  sync-status:    SyncStatus.Idle;
+    in property <string>      last-sync-text: "No pairs configured";
+    in-out property <[SyncPair]> pairs;
+
+    in-out property <int>      current-page:      0;
+    in-out property <int>      config-pair-index: 0;
+
+    // Page 1 — Outlook source picker
+    in property <[string]>  outlook-calendars;
+    callback source-selected(int);
+
+    // Page 2 — Destination provider picker
+    callback dest-provider-selected(int); // 0 = Google Calendar
+
+    // Page 3 — Google Calendar picker
+    in property <[string]>  google-calendars;
+    in property <[string]>  google-calendar-ids;
+    in property <string>    google-status: "";
+    callback dest-selected(int);
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 12px;
+        background: Theme.background;
+        border-width: 1px;
+        border-color: Theme.border;
+        clip: true;
+
+        VerticalLayout {
+
+            // ── Header ────────────────────────────────────────────────────────
+            Rectangle {
+                height: 64px;
+                background: Theme.surface;
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 6px;
+                    alignment: space-between;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: start;
+
+                        Image {
+                            source: @image-url("../assets/icon.svg");
+                            width: 26px; height: 26px;
+                            image-fit: contain;
+                            y: (parent.height - self.height) / 2;
+                        }
+
+                        Text {
+                            text: "ruscal";
+                            color: Theme.text-primary;
+                            font-size: 16px; font-weight: 700;
+                            vertical-alignment: center;
+                            letter-spacing: -0.3px;
+                        }
+
+                        Rectangle {
+                            width: 1px; height: 16px;
+                            background: Theme.border;
+                            y: (parent.height - self.height) / 2;
+                        }
+
+                        SyncIndicator {
+                            status: sync-status;
+                            y: (parent.height - self.height) / 2;
+                            clicked => { root.sync-now(); }
+                        }
+
+                        Text {
+                            text: last-sync-text;
+                            color: Theme.text-secondary;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 0px;
+                        alignment: center;
+
+                        SvgIconBtn {
+                            icon: @image-url("../assets/settings.svg");
+                            clicked => { root.open-settings(); }
+                        }
+                        SvgIconBtn {
+                            icon: @image-url("../assets/minimize.svg");
+                            clicked => { root.minimize(); }
+                        }
+                        SvgIconBtn {
+                            icon: @image-url("../assets/close.svg");
+                            hot-color: Theme.error;
+                            hot-bg: #ff453a22;
+                            clicked => { root.show-quit-dialog = true; }
+                        }
+                    }
+                }
+            }
+
+            Rectangle { height: 1px; background: Theme.border; }
+
+            // ── Page 0: Pairs list ────────────────────────────────────────────
+            if current-page == 0: VerticalLayout {
+                vertical-stretch: 1;
+                padding: 16px;
+                spacing: 10px;
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    viewport-height: (pairs.length - 1) * 66px + 50px;
+                    VerticalLayout {
+                        spacing: 10px;
+                        for pair[i] in pairs: PairRow {
+                            height: i < pairs.length - 1 ? 56px : 40px;
+                            pair: pair;
+                            configure-source => { root.configure-source(i); }
+                            configure-dest   => { root.configure-dest(i); }
+                        }
+                    }
+                }
+            }
+
+            // ── Page 1: Source calendar picker ────────────────────────────────
+            if current-page == 1: VerticalLayout {
+                vertical-stretch: 1;
+
+                Rectangle {
+                    height: 48px;
+                    background: Theme.surface;
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-top: 5px;
+                        padding-bottom: 5px;
+                        spacing: 4px;
+                        alignment: start;
+                        SvgIconBtn {
+                            icon: @image-url("../assets/chevron-left.svg");
+                            clicked => { root.current-page = 0; }
+                        }
+                        Text {
+                            text: "Choose Outlook calendar";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border; }
+
+                if outlook-calendars.length == 0: Rectangle {
+                    vertical-stretch: 1;
+                    Text {
+                        text: "Loading calendars…";
+                        color: Theme.text-secondary;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if outlook-calendars.length > 0: ScrollView {
+                    vertical-stretch: 1;
+                    viewport-height: outlook-calendars.length * 60px;
+                    VerticalLayout {
+                        for cal[i] in outlook-calendars: Rectangle {
+                            height: 60px;
+                            background: cal-t.has-hover ? Theme.surface-elevated : transparent;
+                            animate background { duration: 80ms; }
+                            HorizontalLayout {
+                                padding-left: 20px;
+                                padding-right: 16px;
+                                spacing: 14px;
+                                Image {
+                                    source: @image-url("../assets/outlook.svg");
+                                    width: 24px; height: 24px;
+                                    image-fit: contain;
+                                    colorize: Theme.outlook-color;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                Text {
+                                    text: cal;
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: Theme.border;
+                            }
+                            cal-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.source-selected(i); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Page 2: Destination provider picker ───────────────────────────
+            if current-page == 2: VerticalLayout {
+                vertical-stretch: 1;
+
+                Rectangle {
+                    height: 48px;
+                    background: Theme.surface;
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-top: 5px;
+                        padding-bottom: 5px;
+                        spacing: 4px;
+                        alignment: start;
+                        SvgIconBtn {
+                            icon: @image-url("../assets/chevron-left.svg");
+                            clicked => { root.current-page = 0; }
+                        }
+                        Text {
+                            text: "Choose destination";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border; }
+
+                // Provider list — add more entries here as new destinations land.
+                Rectangle {
+                    height: 60px;
+                    background: gcal-provider-t.has-hover ? Theme.surface-elevated : transparent;
+                    animate background { duration: 80ms; }
+                    HorizontalLayout {
+                        padding-left: 20px;
+                        padding-right: 16px;
+                        spacing: 14px;
+                        Image {
+                            source: @image-url("../assets/gcal.svg");
+                            width: 24px; height: 24px;
+                            image-fit: contain;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        Text {
+                            text: "Google Calendar";
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                    Rectangle {
+                        y: parent.height - 1px;
+                        height: 1px;
+                        background: Theme.border;
+                    }
+                    gcal-provider-t := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.dest-provider-selected(0); }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; } // push list to top
+            }
+
+            // ── Page 3: Google Calendar picker ────────────────────────────────
+            if current-page == 3: VerticalLayout {
+                vertical-stretch: 1;
+
+                Rectangle {
+                    height: 48px;
+                    background: Theme.surface;
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-top: 5px;
+                        padding-bottom: 5px;
+                        spacing: 4px;
+                        alignment: start;
+                        SvgIconBtn {
+                            icon: @image-url("../assets/chevron-left.svg");
+                            clicked => { root.current-page = 2; }
+                        }
+                        Text {
+                            text: "Choose Google Calendar";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border; }
+
+                if google-status != "": VerticalLayout {
+                    vertical-stretch: 1;
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            source: @image-url("../assets/gcal.svg");
+                            width: 40px; height: 40px;
+                            image-fit: contain;
+                        }
+                    }
+                    Rectangle { height: 14px; }
+                    HorizontalLayout {
+                        padding-left: 32px;
+                        padding-right: 32px;
+                        Text {
+                            text: google-status;
+                            color: Theme.text-secondary;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                if google-status == "" && google-calendars.length > 0: ScrollView {
+                    vertical-stretch: 1;
+                    viewport-height: google-calendars.length * 60px;
+                    VerticalLayout {
+                        for cal[i] in google-calendars: Rectangle {
+                            height: 60px;
+                            background: gcal-t.has-hover ? Theme.surface-elevated : transparent;
+                            animate background { duration: 80ms; }
+                            HorizontalLayout {
+                                padding-left: 20px;
+                                padding-right: 16px;
+                                spacing: 14px;
+                                Image {
+                                    source: @image-url("../assets/gcal.svg");
+                                    width: 24px; height: 24px;
+                                    image-fit: contain;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                Text {
+                                    text: cal;
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: Theme.border;
+                            }
+                            gcal-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.dest-selected(i); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Quit confirmation dialog overlay ──────────────────────────────────
+        if show-quit-dialog: Rectangle {
+            width: 100%; height: 100%;
+            background: #000000aa;
+
+            Rectangle {
+                width: 300px; height: 150px;
+                x: (parent.width  - self.width)  / 2;
+                y: (parent.height - self.height) / 2;
+                border-radius: 14px;
+                background: Theme.surface-elevated;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: 22px;
+                    spacing: 14px;
+
+                    VerticalLayout {
+                        spacing: 5px;
+                        Text {
+                            text: "Close ruscal?";
+                            color: Theme.text-primary;
+                            font-size: 15px; font-weight: 700;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "Quitting will stop all syncing.";
+                            color: Theme.text-secondary;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+
+                        Rectangle {
+                            height: 36px;
+                            horizontal-stretch: 1;
+                            border-radius: 8px;
+                            background: min-t.has-hover ? Theme.surface : Theme.border;
+                            animate background { duration: 100ms; }
+                            Text {
+                                text: "Minimize";
+                                color: Theme.text-primary;
+                                font-size: 13px; font-weight: 500;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            min-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.show-quit-dialog = false;
+                                    root.minimize();
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 36px;
+                            horizontal-stretch: 1;
+                            border-radius: 8px;
+                            background: quit-t.has-hover ? Theme.error : #ff453a44;
+                            animate background { duration: 100ms; }
+                            Text {
+                                text: "Quit";
+                                color: quit-t.has-hover ? #ffffff : Theme.error;
+                                font-size: 13px; font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                animate color { duration: 100ms; }
+                            }
+                            quit-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.quit(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
