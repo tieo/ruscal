@@ -20,6 +20,96 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
+// ── Persistence ───────────────────────────────────────────────────────────────
+
+/// Serializable mirror of a configured sync pair.
+/// Slint-generated types cannot be annotated with serde directly.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct SavedPair {
+    source_account: String, // Outlook calendar display name
+    dest_account:   String, // Google Calendar summary
+    dest_id:        String, // Google Calendar CalDAV URL
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AppConfig {
+    pairs:          Vec<SavedPair>,
+    /// UTC timestamp of the last successful sync, ISO-8601.
+    last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn config_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("ruscal")
+        .join("config.json")
+}
+
+fn load_config() -> AppConfig {
+    let path = config_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(pairs: &VecModel<SyncPair>, last_synced_at: Option<chrono::DateTime<chrono::Utc>>) {
+    let saved: Vec<SavedPair> = (0..pairs.row_count())
+        .filter_map(|i| pairs.row_data(i))
+        .filter(|p| !p.dest_id.is_empty()) // only fully configured pairs
+        .map(|p| SavedPair {
+            source_account: p.source_account.to_string(),
+            dest_account:   p.dest_account.to_string(),
+            dest_id:        p.dest_id.to_string(),
+        })
+        .collect();
+
+    let config = AppConfig { pairs: saved, last_synced_at };
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&config) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+
+/// Format a UTC timestamp as a human-readable "X ago" string.
+fn format_time_ago(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = chrono::Utc::now()
+        .signed_duration_since(dt)
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        "Synced · just now".into()
+    } else if secs < 3600 {
+        format!("Synced · {}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("Synced · {}h ago", secs / 3600)
+    } else {
+        format!("Synced · {}d ago", secs / 86400)
+    }
+}
+
+/// Translate raw sync errors into user-friendly messages.
+fn friendly_error(e: &str) -> String {
+    if e.contains("MAPI_E_LOGON_FAILED") || e.contains("0x80040111") {
+        "Outlook not running — open Outlook and try again".into()
+    } else if e.contains("MAPI_E_NOT_INITIALIZED") || e.contains("0x8004011F") {
+        "Outlook MAPI not initialized — restart Outlook".into()
+    } else if e.contains("MAPI") {
+        format!("Outlook error: {e}")
+    } else if e.contains("401") || e.contains("403") {
+        "Google auth expired — re-open the app to re-authenticate".into()
+    } else {
+        format!("Sync error: {e}")
+    }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 fn main() {
     env_logger::init();
 
@@ -49,34 +139,57 @@ fn main() {
 
     let panel = TrayPanel::new().expect("failed to create panel");
 
-    // Mock pair to preview the layout.
     let outlook_color = slint::Color::from_rgb_u8(0, 114, 198);
     let gcal_color    = slint::Color::from_rgb_u8(66, 133, 244);
 
-    let pairs_model = Rc::new(VecModel::from(vec![
-        // Empty placeholder — always one at the end.
-        SyncPair {
-            source_name:    "".into(),
-            source_account: "".into(),
-            source_color:   outlook_color,
-            dest_name:      "".into(),
-            dest_account:   "".into(),
-            dest_color:     gcal_color,
-            dest_id:        "".into(),
-        },
-    ]));
+    // Load persisted config and build the initial pairs list.
+    let config = load_config();
 
+    let mut initial_pairs: Vec<SyncPair> = config.pairs.iter().map(|p| SyncPair {
+        source_name:    "Outlook Calendar".into(),
+        source_account: p.source_account.as_str().into(),
+        source_color:   outlook_color,
+        dest_name:      "Google Calendar".into(),
+        dest_account:   p.dest_account.as_str().into(),
+        dest_color:     gcal_color,
+        dest_id:        p.dest_id.as_str().into(),
+    }).collect();
+
+    // Always keep a blank placeholder at the end for adding new pairs.
+    initial_pairs.push(SyncPair {
+        source_name:    "".into(),
+        source_account: "".into(),
+        source_color:   outlook_color,
+        dest_name:      "".into(),
+        dest_account:   "".into(),
+        dest_color:     gcal_color,
+        dest_id:        "".into(),
+    });
+
+    let pairs_model = Rc::new(VecModel::from(initial_pairs));
     panel.set_pairs(pairs_model.clone().into());
-    panel.set_sync_status(SyncStatus::Success);
-    panel.set_last_sync_text("Synced · just now".into());
+    panel.set_sync_status(SyncStatus::Idle);
+
+    // Show the last successful sync time if we have it.
+    let initial_status = match config.last_synced_at {
+        Some(dt) if !config.pairs.is_empty() => format_time_ago(dt),
+        _ if config.pairs.is_empty()         => "No calendars configured".into(),
+        _                                    => "Never synced".into(),
+    };
+    panel.set_last_sync_text(initial_status.into());
+
+    // ── Sync callback (used by both the UI button and the tray menu) ──────────
 
     panel.on_sync_now({
         let weak  = panel.as_weak();
         let pairs = pairs_model.clone();
         move || {
-            let p = weak.unwrap();
+            let Some(p) = weak.upgrade() else { return };
 
-            // Collect dest URLs of fully-configured pairs.
+            // Don't start a second sync while one is already running.
+            if p.get_sync_status() == SyncStatus::Syncing { return; }
+
+            // Collect URLs of fully-configured pairs.
             let dest_urls: Vec<String> = (0..pairs.row_count())
                 .filter_map(|i| pairs.row_data(i))
                 .filter(|pair| !pair.source_name.is_empty() && !pair.dest_id.is_empty())
@@ -88,6 +201,17 @@ fn main() {
                 p.set_last_sync_text("No calendars configured".into());
                 return;
             }
+
+            // Snapshot pairs for saving in the completion callback (thread-safe).
+            let saved_pairs: Vec<SavedPair> = (0..pairs.row_count())
+                .filter_map(|i| pairs.row_data(i))
+                .filter(|pair| !pair.dest_id.is_empty())
+                .map(|pair| SavedPair {
+                    source_account: pair.source_account.to_string(),
+                    dest_account:   pair.dest_account.to_string(),
+                    dest_id:        pair.dest_id.to_string(),
+                })
+                .collect();
 
             p.set_sync_status(SyncStatus::Syncing);
             p.set_last_sync_text("Syncing…".into());
@@ -107,15 +231,17 @@ fn main() {
                     let Some(p) = weak2.upgrade() else { return };
                     match result {
                         Ok(count) => {
+                            let now = chrono::Utc::now();
+                            save_config_vec(&saved_pairs, Some(now));
                             p.set_sync_status(SyncStatus::Success);
                             p.set_last_sync_text(
                                 format!("Synced {count} events · just now").into()
                             );
                         }
-                        Err(e) => {
+                        Err(ref e) => {
                             log::error!("Sync failed: {e}");
                             p.set_sync_status(SyncStatus::Error);
-                            p.set_last_sync_text(format!("Sync error: {e}").into());
+                            p.set_last_sync_text(friendly_error(e).into());
                         }
                     }
                 }).ok();
@@ -125,15 +251,16 @@ fn main() {
 
     panel.on_minimize({
         let weak = panel.as_weak();
-        move || { weak.unwrap().hide().unwrap(); }
+        move || { if let Some(p) = weak.upgrade() { p.hide().ok(); } }
     });
 
-    panel.on_quit(|| slint::quit_event_loop().unwrap());
+    panel.on_quit(|| { slint::quit_event_loop().ok(); });
 
     panel.on_open_settings({
         let weak = panel.as_weak();
         move || { toast(&weak, "Settings coming soon"); }
     });
+
     panel.on_configure_source({
         let weak = panel.as_weak();
         move |i| {
@@ -164,7 +291,9 @@ fn main() {
                         Err(e) => {
                             log::error!("Failed to list Outlook calendars: {e:?}");
                             p.set_current_page(0);
-                            p.set_last_sync_text("Could not read Outlook calendars".into());
+                            p.set_last_sync_text(
+                                friendly_error(&format!("Outlook: {e}")).into()
+                            );
                         }
                     }
                 }).ok();
@@ -185,8 +314,7 @@ fn main() {
                 pair.source_account = display_name;
                 pair.source_color   = outlook_color;
                 pairs.set_row_data(pair_index, pair);
-                // New placeholder row is added only once the pair is fully
-                // configured (both source and dest). That happens in on_dest_selected.
+                save_config(&pairs, None);
             }
             p.set_current_page(0);
         }
@@ -225,14 +353,18 @@ fn main() {
                             let names: Rc<VecModel<slint::SharedString>> = Rc::new(
                                 VecModel::from(
                                     calendars.iter()
-                                        .map(|c: &google::GoogleCalendar| slint::SharedString::from(&c.summary))
+                                        .map(|c: &google::GoogleCalendar| {
+                                            slint::SharedString::from(&c.summary)
+                                        })
                                         .collect::<Vec<_>>()
                                 )
                             );
                             let ids: Rc<VecModel<slint::SharedString>> = Rc::new(
                                 VecModel::from(
                                     calendars.iter()
-                                        .map(|c: &google::GoogleCalendar| slint::SharedString::from(&c.id))
+                                        .map(|c: &google::GoogleCalendar| {
+                                            slint::SharedString::from(&c.id)
+                                        })
                                         .collect::<Vec<_>>()
                                 )
                             );
@@ -286,11 +418,15 @@ fn main() {
                 });
             }
 
+            // Persist the updated pair configuration.
+            save_config(&pairs, None);
             p.set_current_page(0);
         }
     });
 
-    panel.show().expect("failed to show panel");
+    panel.show().ok();
+
+    // ── Snap panel to bottom-right corner of work area ────────────────────────
 
     let weak_for_pos = panel.as_weak();
     let _pos_timer = slint::Timer::default();
@@ -299,6 +435,22 @@ fn main() {
         std::time::Duration::from_millis(16),
         move || {
             if let Some(p) = weak_for_pos.upgrade() { snap_to_tray(&p); }
+        },
+    );
+
+    // ── Automatic background sync every 15 minutes ────────────────────────────
+
+    let auto_sync_weak = panel.as_weak();
+    let _auto_sync_timer = slint::Timer::default();
+    _auto_sync_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_secs(15 * 60),
+        move || {
+            if let Some(p) = auto_sync_weak.upgrade() {
+                // invoke_sync_now() calls the on_sync_now callback, which already
+                // guards against double-starts (checks SyncStatus::Syncing).
+                p.invoke_sync_now();
+            }
         },
     );
 
@@ -317,25 +469,40 @@ fn main() {
                 if let TrayIconEvent::Click { button: MouseButton::Left, .. } = ev {
                     if let Some(p) = panel_weak.upgrade() {
                         snap_to_tray(&p);
-                        p.show().unwrap();
+                        p.show().ok();
                     }
                 }
             }
 
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if ev.id() == &sync_id {
+                    // Invoke the same sync callback as the UI button.
                     if let Some(p) = panel_weak.upgrade() {
-                        p.set_sync_status(SyncStatus::Syncing);
-                        p.set_last_sync_text("Syncing…".into());
+                        p.invoke_sync_now();
                     }
                 } else if ev.id() == &quit_id {
-                    slint::quit_event_loop().unwrap();
+                    slint::quit_event_loop().ok();
                 }
             }
         },
     );
 
     slint::run_event_loop_until_quit().expect("event loop failed");
+}
+
+/// Save config from a pre-collected Vec<SavedPair> — used from sync threads.
+fn save_config_vec(pairs: &[SavedPair], last_synced_at: Option<chrono::DateTime<chrono::Utc>>) {
+    let config = AppConfig {
+        pairs: pairs.to_vec(),
+        last_synced_at,
+    };
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&config) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 fn toast(weak: &slint::Weak<TrayPanel>, msg: &'static str) {
