@@ -54,6 +54,19 @@ impl CalDavError {
 impl From<reqwest::Error>   for CalDavError { fn from(e: reqwest::Error)   -> Self { Self::Http(e) } }
 impl From<roxmltree::Error> for CalDavError { fn from(e: roxmltree::Error) -> Self { Self::Xml(e)  } }
 
+// ── Shared HTTP client ────────────────────────────────────────────────────────
+
+/// Build a reqwest blocking client with a 30-second timeout.
+///
+/// All CalDAV operations use this so the sync cannot hang indefinitely if
+/// Google Calendar is unresponsive.
+fn client() -> Client {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Discover the calendar-home-set URL given a known principal URL.
@@ -124,7 +137,7 @@ pub fn put_event(
     access_token: &str,
 ) -> Result<(), CalDavError> {
     let url  = format!("{}/{uid}.ics", calendar_url.trim_end_matches('/'));
-    let resp = Client::new()
+    let resp = client()
         .put(&url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
@@ -209,7 +222,7 @@ pub fn find_event_hrefs_by_uid(
     );
 
     let method = reqwest::Method::from_bytes(b"REPORT").expect("valid method");
-    let resp   = Client::new()
+    let resp   = client()
         .request(method, calendar_url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/xml; charset=utf-8")
@@ -253,7 +266,7 @@ pub fn delete_event_at_url(
     url:          &str,
     access_token: &str,
 ) -> Result<(), CalDavError> {
-    let resp = Client::new()
+    let resp = client()
         .delete(url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .send()?;
@@ -279,7 +292,7 @@ pub fn delete_event(
     access_token: &str,
 ) -> Result<bool, CalDavError> {
     let url  = format!("{}/{uid}.ics", calendar_url.trim_end_matches('/'));
-    let resp = Client::new()
+    let resp = client()
         .delete(&url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .send()?;
@@ -309,7 +322,7 @@ pub fn get_event(
     access_token: &str,
 ) -> Result<String, CalDavError> {
     let url = format!("{}/{uid}.ics", calendar_url.trim_end_matches('/'));
-    let resp = Client::new()
+    let resp = client()
         .get(&url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .send()?;
@@ -330,7 +343,7 @@ pub fn get_event(
 
 fn propfind(url: &str, access_token: &str, depth: &str, body: &str) -> Result<String, CalDavError> {
     let method = reqwest::Method::from_bytes(b"PROPFIND").expect("valid method");
-    let resp   = Client::new()
+    let resp   = client()
         .request(method, url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/xml; charset=utf-8")
