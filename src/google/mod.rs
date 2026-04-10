@@ -4,9 +4,7 @@ pub mod calendar;
 
 /// A Google Calendar entry returned from CalDAV discovery.
 pub struct GoogleCalendar {
-    /// CalDAV collection URL — used for event sync.
     pub id:      String,
-    /// Human-readable display name shown in the picker.
     pub summary: String,
 }
 
@@ -16,17 +14,11 @@ use auth::GoogleCreds;
 
 #[derive(Debug)]
 pub enum GoogleError {
-    /// Problem reading the config file or finding credentials.
     Config(String),
-    /// OAuth flow failure (browser, CSRF, token exchange, …).
     Auth(String),
-    /// Google Calendar API returned an unexpected response.
     Api(String),
-    /// I/O error (network, file system).
     Io(std::io::Error),
-    /// HTTP-layer error from reqwest.
     Http(reqwest::Error),
-    /// JSON parse error.
     Json(serde_json::Error),
 }
 
@@ -49,13 +41,6 @@ impl From<serde_json::Error> for GoogleError { fn from(e: serde_json::Error) -> 
 
 // ── Credential loading ────────────────────────────────────────────────────────
 
-/// Load OAuth client credentials from `~/.config/ruscal/.env`.
-///
-/// Expected format:
-/// ```env
-/// GOOGLE_CLIENT_ID=…
-/// GOOGLE_CLIENT_SECRET=…
-/// ```
 fn load_creds() -> Result<GoogleCreds, GoogleError> {
     let path = dirs::config_dir()
         .ok_or_else(|| GoogleError::Config("cannot locate config directory".into()))?
@@ -74,7 +59,6 @@ fn load_creds() -> Result<GoogleCreds, GoogleError> {
 
     let client_id = std::env::var("GOOGLE_CLIENT_ID")
         .map_err(|_| GoogleError::Config("GOOGLE_CLIENT_ID not set in .env".into()))?;
-
     let client_secret = std::env::var("GOOGLE_CLIENT_SECRET")
         .map_err(|_| GoogleError::Config("GOOGLE_CLIENT_SECRET not set in .env".into()))?;
 
@@ -83,29 +67,97 @@ fn load_creds() -> Result<GoogleCreds, GoogleError> {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Get a valid access token.
+/// Get a valid access token for a known account.
 ///
-/// Loads stored tokens and refreshes if expired. If no tokens are stored,
-/// runs the full OAuth 2.0 PKCE flow (opens a browser window).
-pub fn get_access_token() -> Result<String, GoogleError> {
+/// Loads the stored token for `email`. If expired, refreshes it.
+/// Falls back to the legacy single-account token file for migration.
+/// Returns an error if no token exists — the caller must call
+/// `authorize_new_account()` to do the OAuth flow.
+pub fn get_access_token_for(email: &str) -> Result<String, GoogleError> {
     let creds = load_creds()?;
 
-    if let Some(mut tokens) = auth::load_tokens() {
+    // Try per-account token first.
+    if let Some(mut tokens) = auth::load_tokens_for(email) {
         if tokens.is_expired() {
             tokens = auth::refresh(&creds, &tokens)?;
-            auth::save_tokens(&tokens)?;
+            auth::save_tokens_for(email, &tokens)?;
         }
         return Ok(tokens.access_token);
     }
 
-    // No stored tokens — do the full browser-based OAuth flow.
-    let tokens = auth::authorize(&creds)?;
-    auth::save_tokens(&tokens)?;
-    Ok(tokens.access_token)
+    // Migration: try the old single-account file and adopt it if it matches.
+    if let Some(mut tokens) = auth::load_legacy_tokens() {
+        if tokens.is_expired() {
+            tokens = auth::refresh(&creds, &tokens)?;
+        }
+        let legacy_email = auth::get_user_email(&tokens.access_token).unwrap_or_default();
+        if legacy_email == email {
+            auth::save_tokens_for(email, &tokens)?;
+            auth::delete_legacy_tokens();
+            return Ok(tokens.access_token);
+        }
+    }
+
+    Err(GoogleError::Auth(format!(
+        "No stored token for {email} — please re-authenticate"
+    )))
 }
 
-/// List all Google Calendars for the authenticated user.
-pub fn list_google_calendars() -> Result<Vec<GoogleCalendar>, GoogleError> {
-    let token = get_access_token()?;
-    calendar::list_calendars(&token)
+/// Run a full browser OAuth flow for a new (or switched) account.
+///
+/// Returns `(access_token, email)`. Tokens are saved to disk keyed by email.
+pub fn authorize_new_account() -> Result<(String, String), GoogleError> {
+    let creds = load_creds()?;
+    let (tokens, email) = auth::authorize(&creds)?;
+    auth::save_tokens_for(&email, &tokens)?;
+    Ok((tokens.access_token, email))
+}
+
+/// List calendars, optionally reusing an existing account's stored tokens.
+///
+/// - `email_hint = Some(email)` → tries stored tokens for that account first;
+///   if not found runs OAuth (in case the user wants to reauth).
+/// - `email_hint = None` → runs OAuth immediately (new account setup).
+///
+/// Returns `(calendars, email)` so the caller can record which account was used.
+pub fn list_google_calendars(
+    email_hint: Option<&str>,
+) -> Result<(Vec<GoogleCalendar>, String), GoogleError> {
+    let (token, email) = match email_hint {
+        Some(email) => {
+            match get_access_token_for(email) {
+                Ok(token) => (token, email.to_string()),
+                // Token missing/stale — fall through to OAuth.
+                Err(_) => authorize_new_account()?,
+            }
+        }
+        None => {
+            // Check legacy token for seamless migration.
+            let creds = load_creds()?;
+            if let Some(mut tokens) = auth::load_legacy_tokens() {
+                if tokens.is_expired() {
+                    tokens = auth::refresh(&creds, &tokens)?;
+                }
+                let email = auth::get_user_email(&tokens.access_token)?;
+                auth::save_tokens_for(&email, &tokens)?;
+                auth::delete_legacy_tokens();
+                (tokens.access_token, email)
+            } else {
+                authorize_new_account()?
+            }
+        }
+    };
+
+    let calendars = calendar::list_calendars(&token)?;
+    Ok((calendars, email))
+}
+
+/// List all emails that have stored token files.
+pub fn list_stored_accounts() -> Vec<String> {
+    auth::list_stored_accounts()
+}
+
+/// Remove the stored token for one account, forcing re-authentication.
+pub fn sign_out_account(email: &str) {
+    auth::revoke_tokens_for(email);
 }

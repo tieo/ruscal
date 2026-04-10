@@ -21,10 +21,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
-// ── Auto-sync interval ────────────────────────────────────────────────────────
-
-const AUTO_SYNC_SECS: u64 = 15 * 60; // 15 minutes
-
 // ── Persistence ───────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
@@ -32,12 +28,76 @@ struct SavedPair {
     source_account: String,
     dest_account:   String,
     dest_id:        String,
+    #[serde(default)]
+    google_email:   String,
+}
+
+fn default_interval_minutes() -> u64 { 15 }
+
+// ── Autostart (Windows registry) ──────────────────────────────────────────────
+
+const AUTOSTART_VALUE: &str = "ruscal";
+const AUTOSTART_KEY: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+fn get_autostart() -> bool {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE,
+    };
+    use windows::core::PCWSTR;
+    let key_path: Vec<u16> = format!("{AUTOSTART_KEY}\0").encode_utf16().collect();
+    let val_name: Vec<u16> = format!("{AUTOSTART_VALUE}\0").encode_utf16().collect();
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR::from_raw(key_path.as_ptr()),
+                         0, KEY_READ, &mut key).is_err() {
+            return false;
+        }
+        let mut size = 0u32;
+        let mut _kind = REG_VALUE_TYPE::default();
+        let found = RegQueryValueExW(key, PCWSTR::from_raw(val_name.as_ptr()),
+                                     None, Some(&mut _kind), None, Some(&mut size)).is_ok();
+        let _ = RegCloseKey(key);
+        found
+    }
+}
+
+fn set_autostart(enable: bool) {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegSetValueExW, RegDeleteValueW,
+        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ,
+    };
+    use windows::core::PCWSTR;
+    let key_path: Vec<u16> = format!("{AUTOSTART_KEY}\0").encode_utf16().collect();
+    let val_name: Vec<u16> = format!("{AUTOSTART_VALUE}\0").encode_utf16().collect();
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR::from_raw(key_path.as_ptr()),
+                         0, KEY_WRITE, &mut key).is_err() {
+            return;
+        }
+        if enable {
+            if let Ok(exe) = std::env::current_exe() {
+                let path_str: Vec<u16> = format!("{}\0", exe.display()).encode_utf16().collect();
+                let bytes =
+                    std::slice::from_raw_parts(path_str.as_ptr() as *const u8, path_str.len() * 2);
+                let _ = RegSetValueExW(key, PCWSTR::from_raw(val_name.as_ptr()),
+                                       0, REG_SZ, Some(bytes));
+            }
+        } else {
+            let _ = RegDeleteValueW(key, PCWSTR::from_raw(val_name.as_ptr()));
+        }
+        let _ = RegCloseKey(key);
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct AppConfig {
     pairs:          Vec<SavedPair>,
     last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default = "default_interval_minutes")]
+    sync_interval_minutes: u64,
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -55,29 +115,48 @@ fn load_config() -> AppConfig {
         .unwrap_or_default()
 }
 
-/// Save pairs to disk. Preserves the existing `last_synced_at` timestamp unless
-/// `new_sync_time` is `Some`.
+/// Save pairs to disk. Preserves the existing `last_synced_at` and `sync_interval_minutes`
+/// unless overridden.
 fn save_config(pairs: &VecModel<SyncPair>, new_sync_time: Option<chrono::DateTime<chrono::Utc>>) {
-    let last_synced_at = new_sync_time.or_else(|| load_config().last_synced_at);
+    let existing = load_config();
+    let last_synced_at = new_sync_time.or(existing.last_synced_at);
 
     let saved: Vec<SavedPair> = (0..pairs.row_count())
         .filter_map(|i| pairs.row_data(i))
         .filter(|p| !p.dest_id.is_empty())
         .map(|p| SavedPair {
             source_account: p.source_account.to_string(),
-            dest_account:   p.dest_account.to_string(),
+            dest_account:   p.dest_name.to_string(),    // calendar display name
+            google_email:   p.dest_account.to_string(), // google account email
             dest_id:        p.dest_id.to_string(),
         })
         .collect();
 
-    write_config(AppConfig { pairs: saved, last_synced_at });
+    write_config(AppConfig {
+        pairs: saved,
+        last_synced_at,
+        sync_interval_minutes: existing.sync_interval_minutes,
+    });
 }
 
 /// Save from a Vec<SavedPair> (used from sync completion on the UI thread).
 fn save_config_vec(pairs: &[SavedPair], new_sync_time: Option<chrono::DateTime<chrono::Utc>>) {
-    let last_synced_at = new_sync_time.or_else(|| load_config().last_synced_at);
-    write_config(AppConfig { pairs: pairs.to_vec(), last_synced_at });
+    let existing = load_config();
+    let last_synced_at = new_sync_time.or(existing.last_synced_at);
+    write_config(AppConfig {
+        pairs: pairs.to_vec(),
+        last_synced_at,
+        sync_interval_minutes: existing.sync_interval_minutes,
+    });
 }
+
+/// Save a new sync interval, preserving everything else.
+fn save_interval(minutes: u64) {
+    let mut config = load_config();
+    config.sync_interval_minutes = minutes;
+    write_config(config);
+}
+
 
 fn write_config(config: AppConfig) {
     let path = config_path();
@@ -112,18 +191,21 @@ fn format_last_sync(dt: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// "next in Xm" countdown, given the app start time.
-fn format_next_sync(app_start: chrono::DateTime<chrono::Utc>) -> String {
-    let elapsed_secs = chrono::Utc::now()
-        .signed_duration_since(app_start)
-        .num_seconds()
-        .max(0) as u64;
-    let secs_until_next = AUTO_SYNC_SECS - (elapsed_secs % AUTO_SYNC_SECS);
+/// "next in Xm" countdown based on when the last sync happened + interval.
+/// Falls back to `app_start` if never synced.
+fn format_next_sync(
+    last_synced: Option<chrono::DateTime<chrono::Utc>>,
+    app_start: chrono::DateTime<chrono::Utc>,
+    interval_secs: u64,
+) -> String {
+    let base = last_synced.unwrap_or(app_start);
+    let next_at = base + chrono::Duration::seconds(interval_secs as i64);
+    let secs_until = (next_at - chrono::Utc::now()).num_seconds().max(0);
 
-    if secs_until_next < 60 {
+    if secs_until < 60 {
         "next in <1m".into()
     } else {
-        format!("next in {}m", secs_until_next / 60)
+        format!("next in {}m", secs_until / 60)
     }
 }
 
@@ -132,11 +214,12 @@ fn status_text(
     last: Option<chrono::DateTime<chrono::Utc>>,
     app_start: chrono::DateTime<chrono::Utc>,
     has_pairs: bool,
+    interval_secs: u64,
 ) -> String {
     if !has_pairs {
         return "No calendars configured".into();
     }
-    let next = format_next_sync(app_start);
+    let next = format_next_sync(last, app_start, interval_secs);
     match last {
         Some(dt) => format!("{} · {}", format_last_sync(dt), next),
         None     => format!("Never synced · {}", next),
@@ -195,9 +278,15 @@ fn main() {
     let gcal_color    = slint::Color::from_rgb_u8(66, 133, 244);
 
     // Load persisted config.
+    let first_run = !config_path().exists();
     let config = load_config();
     let last_synced: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>> =
         Arc::new(Mutex::new(config.last_synced_at));
+
+    // Enable "Start with Windows" by default on first run.
+    if first_run { set_autostart(true); }
+    let interval_secs: Rc<std::cell::Cell<u64>> =
+        Rc::new(std::cell::Cell::new(config.sync_interval_minutes.max(1) * 60));
 
     let make_placeholder = move || SyncPair {
         source_name:    "".into(),
@@ -213,8 +302,8 @@ fn main() {
         source_name:    "Outlook Calendar".into(),
         source_account: p.source_account.as_str().into(),
         source_color:   outlook_color,
-        dest_name:      "Google Calendar".into(),
-        dest_account:   p.dest_account.as_str().into(),
+        dest_name:      p.dest_account.as_str().into(),  // calendar name
+        dest_account:   p.google_email.as_str().into(),  // google account
         dest_color:     gcal_color,
         dest_id:        p.dest_id.as_str().into(),
     }).collect();
@@ -223,29 +312,39 @@ fn main() {
     let pairs_model = Rc::new(VecModel::from(initial_pairs));
     panel.set_pairs(pairs_model.clone().into());
     panel.set_sync_status(SyncStatus::Idle);
+    panel.set_sync_interval_minutes(config.sync_interval_minutes.max(1) as i32);
+    panel.set_start_with_windows(get_autostart());
+
+    let stored_accounts = google::list_stored_accounts();
+    panel.set_google_accounts(Rc::new(VecModel::from(
+        stored_accounts.into_iter().map(slint::SharedString::from).collect::<Vec<_>>()
+    )).into());
 
     let has_pairs = !config.pairs.is_empty();
     panel.set_last_sync_text(
-        status_text(*last_synced.lock().unwrap(), app_start, has_pairs).into()
+        status_text(*last_synced.lock().unwrap(), app_start, has_pairs, interval_secs.get()).into()
     );
 
     // ── Sync callback ─────────────────────────────────────────────────────────
 
     panel.on_sync_now({
-        let weak        = panel.as_weak();
-        let pairs       = pairs_model.clone();
-        let last_synced = last_synced.clone();
+        let weak          = panel.as_weak();
+        let pairs         = pairs_model.clone();
+        let last_synced   = last_synced.clone();
+        let interval_secs = interval_secs.clone();
         move || {
             let Some(p) = weak.upgrade() else { return };
             if p.get_sync_status() == SyncStatus::Syncing { return; }
 
-            let dest_urls: Vec<String> = (0..pairs.row_count())
+            // Collect (dest_url, google_email) for each configured pair.
+            // dest_account in Slint holds the google email.
+            let sync_targets: Vec<(String, String)> = (0..pairs.row_count())
                 .filter_map(|i| pairs.row_data(i))
                 .filter(|pair| !pair.source_name.is_empty() && !pair.dest_id.is_empty())
-                .map(|pair| pair.dest_id.to_string())
+                .map(|pair| (pair.dest_id.to_string(), pair.dest_account.to_string()))
                 .collect();
 
-            if dest_urls.is_empty() {
+            if sync_targets.is_empty() {
                 p.set_sync_status(SyncStatus::Idle);
                 p.set_last_sync_text("No calendars configured".into());
                 return;
@@ -257,7 +356,8 @@ fn main() {
                 .filter(|pair| !pair.dest_id.is_empty())
                 .map(|pair| SavedPair {
                     source_account: pair.source_account.to_string(),
-                    dest_account:   pair.dest_account.to_string(),
+                    dest_account:   pair.dest_name.to_string(),
+                    google_email:   pair.dest_account.to_string(),
                     dest_id:        pair.dest_id.to_string(),
                 })
                 .collect();
@@ -265,13 +365,15 @@ fn main() {
             p.set_sync_status(SyncStatus::Syncing);
             p.set_last_sync_text("Syncing…".into());
 
-            let weak2       = weak.clone();
+            let secs  = interval_secs.get();
+            let weak2 = weak.clone();
             let last_synced = last_synced.clone();
             std::thread::spawn(move || {
                 let result: Result<usize, String> = (|| {
-                    let token = google::get_access_token().map_err(|e| e.to_string())?;
                     let mut total = 0usize;
-                    for dest_url in &dest_urls {
+                    for (dest_url, google_email) in &sync_targets {
+                        let token = google::get_access_token_for(google_email)
+                            .map_err(|e| e.to_string())?;
                         total += sync::run_sync(dest_url, &token)?;
                     }
                     Ok(total)
@@ -286,11 +388,12 @@ fn main() {
                             save_config_vec(&saved_pairs, Some(now));
                             p.set_sync_status(SyncStatus::Success);
                             p.set_last_sync_text(
-                                format!("Synced {count} events · {}s ago · {}",
-                                    0,
-                                    format_next_sync(app_start)
+                                format!("{} · {}",
+                                    format_last_sync(now),
+                                    format_next_sync(Some(now), app_start, secs),
                                 ).into()
                             );
+                            let _ = count; // surfaced in status line via last_sync
                         }
                         Err(ref e) => {
                             log::error!("Sync failed: {e}");
@@ -306,9 +409,10 @@ fn main() {
     // ── Delete pair ───────────────────────────────────────────────────────────
 
     panel.on_delete_pair({
-        let weak        = panel.as_weak();
-        let pairs       = pairs_model.clone();
-        let last_synced = last_synced.clone();
+        let weak          = panel.as_weak();
+        let pairs         = pairs_model.clone();
+        let last_synced   = last_synced.clone();
+        let interval_secs = interval_secs.clone();
         move |i| {
             let i = i as usize;
             // Don't delete the placeholder row.
@@ -334,7 +438,64 @@ fn main() {
                 .any(|p| !p.dest_id.is_empty());
             if let Some(p) = weak.upgrade() {
                 p.set_last_sync_text(
-                    status_text(*last_synced.lock().unwrap(), app_start, has_pairs).into()
+                    status_text(*last_synced.lock().unwrap(), app_start, has_pairs, interval_secs.get()).into()
+                );
+            }
+        }
+    });
+
+    // ── Clear source / dest (single-side clear) ───────────────────────────────
+
+    panel.on_clear_source({
+        let pairs         = pairs_model.clone();
+        let last_synced   = last_synced.clone();
+        let interval_secs = interval_secs.clone();
+        let weak          = panel.as_weak();
+        move |i| {
+            let i = i as usize;
+            let Some(mut pair) = pairs.row_data(i) else { return };
+            pair.source_name    = "".into();
+            pair.source_account = "".into();
+            pairs.set_row_data(i, pair);
+            save_config(&pairs, None);
+            if let Some(p) = weak.upgrade() {
+                let has_pairs = (0..pairs.row_count())
+                    .filter_map(|j| pairs.row_data(j))
+                    .any(|p| !p.dest_id.is_empty());
+                p.set_last_sync_text(
+                    status_text(*last_synced.lock().unwrap(), app_start, has_pairs, interval_secs.get()).into()
+                );
+            }
+        }
+    });
+
+    panel.on_clear_dest({
+        let pairs         = pairs_model.clone();
+        let last_synced   = last_synced.clone();
+        let interval_secs = interval_secs.clone();
+        let weak          = panel.as_weak();
+        move |i| {
+            let i = i as usize;
+            let Some(mut pair) = pairs.row_data(i) else { return };
+            pair.dest_name    = "".into();
+            pair.dest_account = "".into();
+            pair.dest_id      = "".into();
+            pairs.set_row_data(i, pair);
+            // Clean up: if both sides are now empty and it's not the placeholder, remove it.
+            let both_empty = pairs.row_data(i)
+                .map(|p| p.source_name.is_empty() && p.dest_id.is_empty())
+                .unwrap_or(false);
+            let is_placeholder_slot = i + 1 == pairs.row_count();
+            if both_empty && !is_placeholder_slot {
+                pairs.remove(i);
+            }
+            save_config(&pairs, None);
+            if let Some(p) = weak.upgrade() {
+                let has_pairs = (0..pairs.row_count())
+                    .filter_map(|j| pairs.row_data(j))
+                    .any(|p| !p.dest_id.is_empty());
+                p.set_last_sync_text(
+                    status_text(*last_synced.lock().unwrap(), app_start, has_pairs, interval_secs.get()).into()
                 );
             }
         }
@@ -351,7 +512,11 @@ fn main() {
 
     panel.on_open_settings({
         let weak = panel.as_weak();
-        move || { toast(&weak, "Settings coming soon"); }
+        move || {
+            if let Some(p) = weak.upgrade() {
+                p.set_current_page(4);
+            }
+        }
     });
 
     panel.on_configure_source({
@@ -420,46 +585,54 @@ fn main() {
         }
     });
 
-    panel.on_dest_provider_selected({
+    // Helper: navigate to page 3 and kick off a background calendar load.
+    // `email_hint` = Some(email) to reuse existing tokens, None to force new OAuth.
+    let start_google_picker = {
         let weak = panel.as_weak();
-        move |_provider_index| {
+        move |email_hint: Option<String>| {
             let Some(p) = weak.upgrade() else { return };
-            if p.get_current_page() == 3 { return; }
-
             p.set_google_calendars(Rc::new(VecModel::from(vec![])).into());
             p.set_google_calendar_ids(Rc::new(VecModel::from(vec![])).into());
-            p.set_google_status("Waiting for Google authorization in your browser…".into());
+            p.set_google_account_email("".into());
+            let status = if email_hint.is_none() {
+                "Waiting for Google authorization in your browser…"
+            } else {
+                "Loading calendars…"
+            };
+            p.set_google_status(status.into());
             p.set_current_page(3);
+
+            // Hide the window while the browser OAuth flow is open.
+            if email_hint.is_none() {
+                p.hide().ok();
+            }
 
             let weak2 = weak.clone();
             std::thread::spawn(move || {
-                let result = google::list_google_calendars();
+                let result = google::list_google_calendars(email_hint.as_deref());
                 slint::invoke_from_event_loop(move || {
                     let Some(p) = weak2.upgrade() else { return };
+                    // Bring the window back regardless of outcome.
+                    snap_to_tray(&p);
+                    p.show().ok();
                     if p.get_current_page() != 3 { return; }
                     match result {
-                        Ok(calendars) => {
-                            let names: Rc<VecModel<slint::SharedString>> = Rc::new(
-                                VecModel::from(
-                                    calendars.iter()
-                                        .map(|c: &google::GoogleCalendar| {
-                                            slint::SharedString::from(&c.summary)
-                                        })
-                                        .collect::<Vec<_>>()
-                                )
-                            );
-                            let ids: Rc<VecModel<slint::SharedString>> = Rc::new(
-                                VecModel::from(
-                                    calendars.iter()
-                                        .map(|c: &google::GoogleCalendar| {
-                                            slint::SharedString::from(&c.id)
-                                        })
-                                        .collect::<Vec<_>>()
-                                )
-                            );
+                        Ok((calendars, email)) => {
+                            let names: Rc<VecModel<slint::SharedString>> = Rc::new(VecModel::from(
+                                calendars.iter().map(|c| slint::SharedString::from(&c.summary)).collect::<Vec<_>>()
+                            ));
+                            let ids: Rc<VecModel<slint::SharedString>> = Rc::new(VecModel::from(
+                                calendars.iter().map(|c| slint::SharedString::from(&c.id)).collect::<Vec<_>>()
+                            ));
                             p.set_google_calendars(names.into());
                             p.set_google_calendar_ids(ids.into());
+                            p.set_google_account_email(email.into());
                             p.set_google_status("".into());
+                            // Refresh accounts list in case a new account was just added.
+                            let accounts = google::list_stored_accounts();
+                            p.set_google_accounts(Rc::new(VecModel::from(
+                                accounts.into_iter().map(slint::SharedString::from).collect::<Vec<_>>()
+                            )).into());
                         }
                         Err(e) => {
                             log::error!("Failed to list Google Calendars: {e}");
@@ -469,6 +642,72 @@ fn main() {
                 }).ok();
             });
         }
+    };
+
+    panel.on_dest_provider_selected({
+        let weak  = panel.as_weak();
+        let pairs = pairs_model.clone();
+        let start = start_google_picker.clone();
+        move |_provider_index| {
+            let Some(p) = weak.upgrade() else { return };
+            if p.get_current_page() == 3 { return; }
+            // Use the existing account for this pair if it has one.
+            let pair_index = p.get_config_pair_index() as usize;
+            let email_hint = pairs.row_data(pair_index)
+                .filter(|pair| !pair.dest_account.is_empty())
+                .map(|pair| pair.dest_account.to_string());
+            start(email_hint);
+        }
+    });
+
+    // "+ Add account" chip on page 3 footer — forces new OAuth, stays on page 3.
+    panel.on_settings_google_sign_out({
+        let start = start_google_picker.clone();
+        move || { start(None); }
+    });
+
+    // Account chip clicked on page 3 footer — switch to an existing account.
+    panel.on_switch_google_account({
+        let start = start_google_picker.clone();
+        move |email| { start(Some(email.to_string())); }
+    });
+
+    // "Add Google account" from Settings — OAuth without navigating away from settings.
+    panel.on_add_google_account({
+        let weak = panel.as_weak();
+        move || {
+            let Some(p) = weak.upgrade() else { return };
+            p.hide().ok();
+            let weak2 = weak.clone();
+            std::thread::spawn(move || {
+                let result = google::authorize_new_account();
+                slint::invoke_from_event_loop(move || {
+                    let Some(p) = weak2.upgrade() else { return };
+                    snap_to_tray(&p);
+                    p.show().ok();
+                    if let Ok((_token, _email)) = result {
+                        let accounts = google::list_stored_accounts();
+                        p.set_google_accounts(Rc::new(VecModel::from(
+                            accounts.into_iter().map(slint::SharedString::from).collect::<Vec<_>>()
+                        )).into());
+                    }
+                }).ok();
+            });
+        }
+    });
+
+    // "Remove" button next to an account in Settings.
+    panel.on_remove_google_account({
+        let weak = panel.as_weak();
+        move |email| {
+            google::sign_out_account(&email);
+            let accounts = google::list_stored_accounts();
+            if let Some(p) = weak.upgrade() {
+                p.set_google_accounts(Rc::new(VecModel::from(
+                    accounts.into_iter().map(slint::SharedString::from).collect::<Vec<_>>()
+                )).into());
+            }
+        }
     });
 
     panel.on_dest_selected({
@@ -476,7 +715,8 @@ fn main() {
         let pairs = pairs_model.clone();
         move |cal_index| {
             let Some(p) = weak.upgrade() else { return };
-            let pair_index = p.get_config_pair_index() as usize;
+            let pair_index   = p.get_config_pair_index() as usize;
+            let google_email = p.get_google_account_email().to_string();
 
             let cal_ids   = p.get_google_calendar_ids();
             let calendars = p.get_google_calendars();
@@ -484,28 +724,35 @@ fn main() {
             let dest_id = cal_ids.row_data(cal_index as usize).unwrap_or_default();
 
             let mut pair = pairs.row_data(pair_index).unwrap_or_default();
-            pair.dest_name    = "Google Calendar".into();
-            pair.dest_account = summary;
+            pair.dest_name    = summary;           // calendar display name
+            pair.dest_account = google_email.into(); // google account email
             pair.dest_color   = gcal_color;
             pair.dest_id      = dest_id;
             pairs.set_row_data(pair_index, pair.clone());
 
             if pair_index + 1 >= pairs.row_count()
                 && !pair.source_name.is_empty()
-                && !pair.dest_name.is_empty()
+                && !pair.dest_id.is_empty()
             {
                 pairs.push(make_placeholder());
             }
 
             save_config(&pairs, None);
             p.set_current_page(0);
-
-            // Trigger an immediate sync now that the pair is configured.
             p.invoke_sync_now();
         }
     });
 
     panel.show().ok();
+
+    // ── Sync on launch (always) ───────────────────────────────────────────────
+
+    if !config.pairs.is_empty() {
+        let weak_launch = panel.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(500), move || {
+            if let Some(p) = weak_launch.upgrade() { p.invoke_sync_now(); }
+        });
+    }
 
     // ── Snap panel to bottom-right of work area ───────────────────────────────
 
@@ -523,6 +770,7 @@ fn main() {
 
     let status_weak    = panel.as_weak();
     let status_synced  = last_synced.clone();
+    let status_isecs   = interval_secs.clone();
     let _status_timer  = slint::Timer::default();
     _status_timer.start(
         slint::TimerMode::Repeated,
@@ -534,24 +782,56 @@ fn main() {
                 .filter_map(|i| p.get_pairs().row_data(i))
                 .any(|pair: SyncPair| !pair.dest_id.is_empty());
             p.set_last_sync_text(
-                status_text(*status_synced.lock().unwrap(), app_start, has_pairs).into()
+                status_text(*status_synced.lock().unwrap(), app_start, has_pairs, status_isecs.get()).into()
             );
         },
     );
 
-    // ── Auto-sync every 15 minutes ────────────────────────────────────────────
+    // ── Auto-sync timer (restartable when interval changes) ───────────────────
 
-    let auto_sync_weak = panel.as_weak();
-    let _auto_sync_timer = slint::Timer::default();
-    _auto_sync_timer.start(
-        slint::TimerMode::Repeated,
-        std::time::Duration::from_secs(AUTO_SYNC_SECS),
-        move || {
-            if let Some(p) = auto_sync_weak.upgrade() {
-                p.invoke_sync_now();
-            }
-        },
-    );
+    let auto_sync_timer = Rc::new(slint::Timer::default());
+    {
+        let auto_sync_weak = panel.as_weak();
+        let t = auto_sync_timer.clone();
+        t.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(interval_secs.get()),
+            move || {
+                if let Some(p) = auto_sync_weak.upgrade() {
+                    p.invoke_sync_now();
+                }
+            },
+        );
+    }
+
+    // ── Settings: interval changed ────────────────────────────────────────────
+
+    panel.on_settings_interval_changed({
+        let weak          = panel.as_weak();
+        let interval_secs = interval_secs.clone();
+        let timer         = auto_sync_timer.clone();
+        move |minutes| {
+            let minutes = (minutes as u64).max(1);
+            let secs    = minutes * 60;
+            interval_secs.set(secs);
+            save_interval(minutes);
+
+            // Restart auto-sync timer with new interval.
+            let weak2 = weak.clone();
+            timer.start(
+                slint::TimerMode::Repeated,
+                std::time::Duration::from_secs(secs),
+                move || {
+                    if let Some(p) = weak2.upgrade() { p.invoke_sync_now(); }
+                },
+            );
+        }
+    });
+
+    panel.on_settings_startup_changed(|enable| {
+        set_autostart(enable);
+    });
+
 
     // ── Tray + menu event polling ─────────────────────────────────────────────
 
@@ -586,19 +866,6 @@ fn main() {
     );
 
     slint::run_event_loop_until_quit().expect("event loop failed");
-}
-
-fn toast(weak: &slint::Weak<TrayPanel>, msg: &'static str) {
-    if let Some(p) = weak.upgrade() {
-        let prev = p.get_last_sync_text().to_string();
-        p.set_last_sync_text(msg.into());
-        let weak2 = weak.clone();
-        slint::Timer::single_shot(std::time::Duration::from_secs(2), move || {
-            if let Some(p2) = weak2.upgrade() {
-                p2.set_last_sync_text(prev.into());
-            }
-        });
-    }
 }
 
 fn snap_to_tray(panel: &TrayPanel) {
