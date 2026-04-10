@@ -1,14 +1,7 @@
 /// OAuth 2.0 PKCE flow for installed desktop applications.
-///
-/// # Flow
-/// 1. Bind a random-port localhost TCP listener.
-/// 2. Build the Google authorization URL with a PKCE challenge.
-/// 3. Open the URL in the system browser via [`open`].
-/// 4. Wait (up to 5 min) for Google to redirect to `localhost:<port>/callback?code=…`.
-/// 5. Exchange the code + PKCE verifier for access + refresh tokens.
-/// 6. Persist tokens to disk; return access token.
 use std::io::{BufRead, BufReader, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
@@ -18,23 +11,21 @@ use super::GoogleError;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Client credentials from Google Cloud Console.
 pub struct GoogleCreds {
     pub client_id:     String,
     pub client_secret: String,
 }
 
-/// Access + refresh token pair with expiry.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Tokens {
     pub access_token:  String,
     pub refresh_token: String,
-    /// Unix timestamp (seconds) when `access_token` expires.
     pub expires_at:    i64,
+    #[serde(default)]
+    pub email:         String,
 }
 
 impl Tokens {
-    /// True when the access token is within 60 s of expiry.
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -44,32 +35,91 @@ impl Tokens {
     }
 }
 
-// ── Token persistence ─────────────────────────────────────────────────────────
+// ── Token persistence (per-account) ──────────────────────────────────────────
 
-fn token_path() -> Option<std::path::PathBuf> {
+fn tokens_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("ruscal").join("tokens"))
+}
+
+fn token_path_for(email: &str) -> Option<PathBuf> {
+    let safe = email.replace('@', "_at_").replace('.', "_dot_");
+    tokens_dir().map(|d| d.join(format!("{safe}.json")))
+}
+
+/// Legacy single-account path — kept for migration only.
+pub fn legacy_token_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("ruscal").join("google_token.json"))
 }
 
-/// Load tokens from disk. Returns `None` if not found or unreadable.
-pub fn load_tokens() -> Option<Tokens> {
-    let data = std::fs::read_to_string(token_path()?).ok()?;
+pub fn load_tokens_for(email: &str) -> Option<Tokens> {
+    let data = std::fs::read_to_string(token_path_for(email)?).ok()?;
     serde_json::from_str(&data).ok()
 }
 
-/// Persist tokens to `~/.config/ruscal/google_token.json`.
-pub fn save_tokens(tokens: &Tokens) -> Result<(), GoogleError> {
-    let path = token_path()
+pub fn save_tokens_for(email: &str, tokens: &Tokens) -> Result<(), GoogleError> {
+    let path = token_path_for(email)
         .ok_or_else(|| GoogleError::Config("cannot locate config directory".into()))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(tokens)?)?;
+    // Embed the email in the token file so we can recover it without filename parsing.
+    let mut t = tokens.clone();
+    t.email = email.to_owned();
+    std::fs::write(path, serde_json::to_string_pretty(&t)?)?;
     Ok(())
+}
+
+pub fn revoke_tokens_for(email: &str) {
+    if let Some(path) = token_path_for(email) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+pub fn load_legacy_tokens() -> Option<Tokens> {
+    let data = std::fs::read_to_string(legacy_token_path()?).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+pub fn delete_legacy_tokens() {
+    if let Some(path) = legacy_token_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Returns all emails that have stored token files, sorted alphabetically.
+pub fn list_stored_accounts() -> Vec<String> {
+    let Some(dir) = tokens_dir() else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return vec![] };
+
+    let mut emails = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(tokens) = serde_json::from_str::<Tokens>(&data) {
+                let email = if !tokens.email.is_empty() {
+                    tokens.email
+                } else {
+                    // Fallback: decode email from filename for pre-existing tokens.
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.replace("_at_", "@").replace("_dot_", "."))
+                        .unwrap_or_default()
+                };
+                if !email.is_empty() {
+                    emails.push(email);
+                }
+            }
+        }
+    }
+    emails.sort();
+    emails
 }
 
 // ── Token refresh ─────────────────────────────────────────────────────────────
 
-/// Use the stored refresh token to get a new access token.
 pub fn refresh(creds: &GoogleCreds, tokens: &Tokens) -> Result<Tokens, GoogleError> {
     let resp: serde_json::Value = reqwest::blocking::Client::new()
         .post("https://oauth2.googleapis.com/token")
@@ -88,18 +138,13 @@ pub fn refresh(creds: &GoogleCreds, tokens: &Tokens) -> Result<Tokens, GoogleErr
         .to_owned();
 
     let expires_in = resp["expires_in"].as_i64().unwrap_or(3600);
-    let expires_at = now_secs() + expires_in;
-
-    Ok(Tokens { access_token, refresh_token: tokens.refresh_token.clone(), expires_at })
+    Ok(Tokens { access_token, refresh_token: tokens.refresh_token.clone(), expires_at: now_secs() + expires_in, email: tokens.email.clone() })
 }
 
 // ── Full OAuth flow ───────────────────────────────────────────────────────────
 
-/// Run the browser-based OAuth 2.0 PKCE authorization flow.
-///
-/// Opens the system browser for the user to grant access, then captures the
-/// redirect on a local listener and exchanges the code for tokens.
-pub fn authorize(creds: &GoogleCreds) -> Result<Tokens, GoogleError> {
+/// Run the browser-based PKCE flow. Returns `(tokens, email)`.
+pub fn authorize(creds: &GoogleCreds) -> Result<(Tokens, String), GoogleError> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port     = listener.local_addr()?.port();
 
@@ -126,13 +171,34 @@ pub fn authorize(creds: &GoogleCreds) -> Result<Tokens, GoogleError> {
 
     open::that(&auth_url).map_err(|e| GoogleError::Auth(format!("cannot open browser: {e}")))?;
 
-    let code = wait_for_code(listener, &state)?;
-    exchange_code(creds, &code, &verifier, &redirect_uri)
+    let code   = wait_for_code(listener, &state)?;
+    let tokens = exchange_code(creds, &code, &verifier, &redirect_uri)?;
+    let email  = get_user_email(&tokens.access_token)?;
+    Ok((tokens, email))
+}
+
+// ── User info ─────────────────────────────────────────────────────────────────
+
+pub fn get_user_email(access_token: &str) -> Result<String, super::GoogleError> {
+    let response = reqwest::blocking::Client::new()
+        .get("https://www.googleapis.com/oauth2/v1/userinfo")
+        .bearer_auth(access_token)
+        .send()?;
+
+    let status = response.status();
+    let body   = response.text()?;
+
+    let resp: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| super::GoogleError::Auth(format!("userinfo parse error: {e} — body: {body}")))?;
+
+    resp["email"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| super::GoogleError::Auth(format!("no email in userinfo (status={status}): {body}")))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Generate a (code_verifier, code_challenge) PKCE pair.
 fn pkce_pair() -> (String, String) {
     let bytes: Vec<u8> = (0..32).map(|_| rand::thread_rng().r#gen()).collect();
     let verifier  = base64url(&bytes);
@@ -140,7 +206,6 @@ fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-/// URL-safe base64 encoding without padding (RFC 4648 §5).
 fn base64url(input: &[u8]) -> String {
     const C: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity((input.len() * 4 + 2) / 3);
@@ -157,7 +222,6 @@ fn base64url(input: &[u8]) -> String {
     out
 }
 
-/// Percent-encode all bytes that are not RFC 3986 unreserved characters.
 fn percent_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -182,16 +246,9 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-// ── Local callback listener ───────────────────────────────────────────────────
-
-/// Wait (up to 5 minutes) for Google's redirect to our local callback URL.
-///
-/// Spawns an inner thread so we can apply a timeout without blocking forever
-/// if the user cancels in the browser.
 fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, GoogleError> {
     let expected = expected_state.to_owned();
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, GoogleError>>();
-
     std::thread::spawn(move || {
         let result = listener
             .accept()
@@ -199,25 +256,19 @@ fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, 
             .and_then(|(stream, _)| handle_callback(stream, &expected));
         let _ = tx.send(result);
     });
-
     rx.recv_timeout(Duration::from_secs(300))
         .map_err(|_| GoogleError::Auth("OAuth flow timed out (5 min)".into()))?
 }
 
-/// Read the HTTP request from the browser, send a success page, extract the code.
 fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Result<String, GoogleError> {
-    // Read the first line of the HTTP request (GET /callback?… HTTP/1.1).
     let mut request_line = String::new();
     {
         let mut reader = BufReader::new(&stream);
         reader.read_line(&mut request_line)?;
-        // Drain remaining headers so the browser doesn't show "connection reset".
         for line in reader.lines() {
             if line?.is_empty() { break; }
         }
     }
-
-    // Always send a response so the browser shows something meaningful.
     let body = "<!doctype html><html><body style='font-family:sans-serif;padding:40px'>\
                 <h2>Authorized!</h2><p>You can close this tab and return to ruscal.</p>\
                 </body></html>";
@@ -226,16 +277,13 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Result<String
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\n\r\n{}",
         body.len(), body
     )?;
-
     parse_callback_line(&request_line, expected_state)
 }
 
-/// Extract `code` from a request line like `GET /callback?code=X&state=Y HTTP/1.1`.
 fn parse_callback_line(line: &str, expected_state: &str) -> Result<String, GoogleError> {
     let path = line.split_whitespace().nth(1)
         .ok_or_else(|| GoogleError::Auth("malformed HTTP request line".into()))?;
     let query = path.splitn(2, '?').nth(1).unwrap_or("");
-
     let mut code  = None;
     let mut state = None;
     for param in query.split('&') {
@@ -247,38 +295,11 @@ fn parse_callback_line(line: &str, expected_state: &str) -> Result<String, Googl
             }
         }
     }
-
     if state.as_deref() != Some(expected_state) {
         return Err(GoogleError::Auth("CSRF state mismatch".into()));
     }
     code.ok_or_else(|| GoogleError::Auth("no 'code' parameter in callback URL".into()))
 }
-
-// ── User info ─────────────────────────────────────────────────────────────────
-
-/// Fetch the authenticated user's email address.
-///
-/// Used to build the CalDAV home URL: `https://apidata.googleusercontent.com/caldav/v1/{email}/`
-#[allow(dead_code)] // will be used for displaying the signed-in account
-pub fn get_user_email(access_token: &str) -> Result<String, super::GoogleError> {
-    let response = reqwest::blocking::Client::new()
-        .get("https://www.googleapis.com/oauth2/v1/userinfo")
-        .bearer_auth(access_token)
-        .send()?;
-
-    let status = response.status();
-    let body   = response.text()?;
-
-    let resp: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| super::GoogleError::Auth(format!("userinfo parse error: {e} — body: {body}")))?;
-
-    resp["email"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| super::GoogleError::Auth(format!("no email in userinfo (status={status}): {body}")))
-}
-
-// ── Code exchange ─────────────────────────────────────────────────────────────
 
 fn exchange_code(
     creds:        &GoogleCreds,
@@ -302,12 +323,9 @@ fn exchange_code(
     let access_token = resp["access_token"].as_str()
         .ok_or_else(|| GoogleError::Auth(format!("token exchange failed: {resp}")))?
         .to_owned();
-
     let refresh_token = resp["refresh_token"].as_str()
         .ok_or_else(|| GoogleError::Auth("no refresh_token in response".into()))?
         .to_owned();
-
     let expires_in = resp["expires_in"].as_i64().unwrap_or(3600);
-
-    Ok(Tokens { access_token, refresh_token, expires_at: now_secs() + expires_in })
+    Ok(Tokens { access_token, refresh_token, expires_at: now_secs() + expires_in, email: String::new() })
 }

@@ -88,6 +88,8 @@ component SvgIconBtn {
     in property <color>  idle-color: Theme.text-secondary;
     in property <color>  hot-color:  Theme.text-primary;
     in property <color>  hot-bg:     Theme.surface-elevated;
+    /// Expose hover state so parent can include it in zone-hover logic.
+    out property <bool>  hovered:    t.has-hover;
     callback clicked;
 
     width: 38px;
@@ -111,30 +113,132 @@ component SvgIconBtn {
     t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }
 
+// ── Compact icon button (for card overlays) ───────────────────────────────────
+
+component CardIconBtn {
+    in property <image>  icon;
+    in property <length> btn-size:   24px;
+    in property <length> icon-size:  13px;
+    in property <color>  idle-color: Theme.text-secondary;
+    in property <color>  hot-color:  Theme.text-primary;
+    in property <color>  hot-bg:     Theme.surface-elevated;
+    out property <bool>  hovered:    t.has-hover;
+    callback clicked;
+
+    width: btn-size;
+    height: btn-size;
+
+    Rectangle {
+        border-radius: 5px;
+        background: t.has-hover ? root.hot-bg : transparent;
+        animate background { duration: 80ms; }
+
+        Image {
+            width: root.icon-size; height: root.icon-size;
+            source: root.icon;
+            image-fit: contain;
+            colorize: t.has-hover ? root.hot-color : root.idle-color;
+            animate colorize { duration: 80ms; }
+        }
+    }
+
+    t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// ── Toggle switch ─────────────────────────────────────────────────────────────
+
+component SettingsToggle {
+    in-out property <bool> checked: false;
+    callback toggled(bool);
+
+    width: 40px;
+    height: 22px;
+
+    Rectangle {
+        border-radius: 11px;
+        background: checked ? Theme.accent : Theme.border;
+        animate background { duration: 150ms; }
+
+        Rectangle {
+            width: 18px; height: 18px;
+            border-radius: 9px;
+            background: Theme.text-primary;
+            x: checked ? parent.width - self.width - 2px : 2px;
+            y: 2px;
+            animate x { duration: 150ms; easing: ease-in-out; }
+        }
+    }
+
+    t := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// ── Hover-reveal overlay (gradient panel + stacked edit/trash buttons) ────────
+
+component CardOverlay inherits Rectangle {
+    in property <color> accent-color;
+    in property <bool>  card-hovered;
+    callback edit();
+    callback clear();
+
+    width: 60px;
+    background: @linear-gradient(90deg, transparent, accent-color.with-alpha(0.35));
+    opacity: card-hovered || ov-edit.hovered || ov-del.hovered ? 1.0 : 0.0;
+    animate opacity { duration: 150ms; }
+
+    ov-edit := CardIconBtn {
+        x: parent.width - self.width - 6px;
+        y: parent.height / 2 - self.height - 2px;
+        icon: @image-url("../assets/edit.svg");
+        idle-color: Theme.text-secondary;
+        hot-color: Theme.text-primary;
+        hot-bg: root.accent-color.with-alpha(0.35);
+        clicked => { root.edit(); }
+    }
+    ov-del := CardIconBtn {
+        x: parent.width - self.width - 6px;
+        y: parent.height / 2 + 2px;
+        icon: @image-url("../assets/trash.svg");
+        idle-color: Theme.text-secondary;
+        hot-color: Theme.error;
+        hot-bg: #ff453a22;
+        clicked => { root.clear(); }
+    }
+}
+
 // ── Single sync pair row ──────────────────────────────────────────────────────
 
 component PairRow {
     in property <SyncPair> pair;
     callback configure-source();
     callback configure-dest();
-    callback delete();
+    callback delete();           // removes the whole pair
+    callback clear-source();     // clears just the source side
+    callback clear-dest();       // clears just the dest side
 
-    property <bool> is-configured: pair.source-name != "" && pair.dest-name != "";
+    property <bool> src-configured: pair.source-name != "";
+    property <bool> dst-configured: pair.dest-name   != "";
 
     HorizontalLayout {
-        spacing: 8px;
+        spacing: 12px;
 
-        // Source
+        // ── Source card ───────────────────────────────────────────────────────
         Rectangle {
             horizontal-stretch: 1;
             border-radius: 10px;
-            background: pair.source-name != ""
+            background: src-configured
                 ? pair.source-color.with-alpha(src-t.has-hover ? 0.18 : 0.10)
                 : (src-t.has-hover ? Theme.surface-elevated : Theme.surface);
             animate background { duration: 100ms; }
             clip: true;
 
-            if pair.source-name == "": VerticalLayout {
+            // Empty "+" placeholder
+            if !src-configured: VerticalLayout {
                 alignment: center;
                 padding: 8px;
                 Text {
@@ -146,7 +250,8 @@ component PairRow {
                 }
             }
 
-            if pair.source-name != "": HorizontalLayout {
+            // Configured content
+            if src-configured: HorizontalLayout {
                 padding-top: 8px; padding-bottom: 8px;
                 padding-left: 12px; padding-right: 10px;
                 spacing: 10px;
@@ -179,7 +284,8 @@ component PairRow {
                 }
             }
 
-            if pair.source-name != "": Rectangle {
+            // Left accent bar
+            if src-configured: Rectangle {
                 x: 0px; y: 0px;
                 width: 4px; height: parent.height;
                 background: pair.source-color;
@@ -188,6 +294,15 @@ component PairRow {
             src-t := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.configure-source(); }
+            }
+
+            if src-configured: CardOverlay {
+                x: parent.width - self.width;
+                height: parent.height;
+                accent-color: pair.source-color;
+                card-hovered: src-t.has-hover;
+                edit  => { root.configure-source(); }
+                clear => { root.clear-source(); }
             }
         }
 
@@ -204,17 +319,17 @@ component PairRow {
             }
         }
 
-        // Destination
+        // ── Destination card ──────────────────────────────────────────────────
         Rectangle {
             horizontal-stretch: 1;
             border-radius: 10px;
-            background: pair.dest-name != ""
+            background: dst-configured
                 ? pair.dest-color.with-alpha(dst-t.has-hover ? 0.18 : 0.10)
                 : (dst-t.has-hover ? Theme.surface-elevated : Theme.surface);
             animate background { duration: 100ms; }
             clip: true;
 
-            if pair.dest-name == "": VerticalLayout {
+            if !dst-configured: VerticalLayout {
                 alignment: center;
                 padding: 8px;
                 Text {
@@ -226,7 +341,7 @@ component PairRow {
                 }
             }
 
-            if pair.dest-name != "": HorizontalLayout {
+            if dst-configured: HorizontalLayout {
                 padding-top: 8px; padding-bottom: 8px;
                 padding-left: 12px; padding-right: 10px;
                 spacing: 10px;
@@ -258,7 +373,7 @@ component PairRow {
                 }
             }
 
-            if pair.dest-name != "": Rectangle {
+            if dst-configured: Rectangle {
                 x: 0px; y: 0px;
                 width: 4px; height: parent.height;
                 background: pair.dest-color;
@@ -268,17 +383,15 @@ component PairRow {
                 mouse-cursor: pointer;
                 clicked => { root.configure-dest(); }
             }
-        }
 
-        // Trash button — only visible for fully configured pairs.
-        if is-configured: SvgIconBtn {
-            icon: @image-url("../assets/trash.svg");
-            icon-size: 16px;
-            width: 30px;
-            idle-color: Theme.text-tertiary;
-            hot-color: Theme.error;
-            hot-bg: #ff453a22;
-            clicked => { root.delete(); }
+            if dst-configured: CardOverlay {
+                x: parent.width - self.width;
+                height: parent.height;
+                accent-color: pair.dest-color;
+                card-hovered: dst-t.has-hover;
+                edit  => { root.configure-dest(); }
+                clear => { root.clear-dest(); }
+            }
         }
     }
 }
@@ -297,6 +410,8 @@ export component TrayPanel inherits Window {
     callback configure-source(int);
     callback configure-dest(int);
     callback delete-pair(int);
+    callback clear-source(int);
+    callback clear-dest(int);
     callback open-settings();
     callback minimize();
     callback quit();
@@ -321,7 +436,19 @@ export component TrayPanel inherits Window {
     in property <[string]>  google-calendars;
     in property <[string]>  google-calendar-ids;
     in property <string>    google-status: "";
+    in property <string>    google-account-email: "";
+    in property <[string]>  google-accounts;
     callback dest-selected(int);
+    callback switch-google-account(string); // switch to an existing connected account
+    callback settings-google-sign-out();    // add a new account (OAuth) while on page 3
+
+    // Page 4 — Settings
+    in-out property <int>  sync-interval-minutes: 15;
+    in-out property <bool> start-with-windows: false;
+    callback settings-interval-changed(int);
+    callback settings-startup-changed(bool);
+    callback add-google-account();          // add a new account from settings
+    callback remove-google-account(string); // remove a connected account
 
     Rectangle {
         width: 100%;
@@ -377,7 +504,7 @@ export component TrayPanel inherits Window {
 
                         Text {
                             text: last-sync-text;
-                            color: Theme.text-secondary;
+                            color: sync-status == SyncStatus.Error ? Theme.error : Theme.text-secondary;
                             font-size: 13px;
                             vertical-alignment: center;
                         }
@@ -415,15 +542,17 @@ export component TrayPanel inherits Window {
 
                 ScrollView {
                     vertical-stretch: 1;
-                    viewport-height: (pairs.length - 1) * 66px + 50px;
+                    viewport-height: (pairs.length - 1) * 82px + 50px;
                     VerticalLayout {
                         spacing: 10px;
                         for pair[i] in pairs: PairRow {
-                            height: i < pairs.length - 1 ? 56px : 40px;
+                            height: i < pairs.length - 1 ? 72px : 44px;
                             pair: pair;
                             configure-source => { root.configure-source(i); }
                             configure-dest   => { root.configure-dest(i); }
                             delete           => { root.delete-pair(i); }
+                            clear-source     => { root.clear-source(i); }
+                            clear-dest       => { root.clear-dest(i); }
                         }
                     }
                 }
@@ -538,7 +667,6 @@ export component TrayPanel inherits Window {
                 }
                 Rectangle { height: 1px; background: Theme.border; }
 
-                // Provider list — add more entries here as new destinations land.
                 Rectangle {
                     height: 60px;
                     background: gcal-provider-t.has-hover ? Theme.surface-elevated : transparent;
@@ -572,7 +700,7 @@ export component TrayPanel inherits Window {
                     }
                 }
 
-                Rectangle { vertical-stretch: 1; } // push list to top
+                Rectangle { vertical-stretch: 1; }
             }
 
             // ── Page 3: Google Calendar picker ────────────────────────────────
@@ -665,6 +793,277 @@ export component TrayPanel inherits Window {
                                 mouse-cursor: pointer;
                                 clicked => { root.dest-selected(i); }
                             }
+                        }
+                    }
+                }
+
+                // Account footer — chip row showing all connected accounts
+                Rectangle { height: 1px; background: Theme.border; }
+                Rectangle {
+                    height: 52px;
+                    HorizontalLayout {
+                        padding-left: 12px; padding-right: 12px;
+                        padding-top: 10px; padding-bottom: 10px;
+                        spacing: 6px;
+                        alignment: start;
+
+                        // One chip per connected account
+                        for acct in google-accounts: Rectangle {
+                            width: 130px;
+                            height: 32px;
+                            border-radius: 16px;
+                            border-width: 1px;
+                            border-color: acct == google-account-email
+                                ? Theme.accent : (acct-t.has-hover ? Theme.accent : Theme.border);
+                            background: acct == google-account-email
+                                ? Theme.accent-dim
+                                : (acct-t.has-hover ? Theme.surface-elevated : Theme.surface);
+                            animate background   { duration: 80ms; }
+                            animate border-color { duration: 80ms; }
+                            Text {
+                                text: acct;
+                                color: acct == google-account-email ? Theme.accent
+                                     : (acct-t.has-hover ? Theme.text-primary : Theme.text-secondary);
+                                font-size: 10px; font-weight: acct == google-account-email ? 600 : 400;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                animate color { duration: 80ms; }
+                            }
+                            acct-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.switch-google-account(acct); }
+                            }
+                        }
+
+                        // "+ Add account" chip
+                        Rectangle {
+                            width: 100px;
+                            height: 32px;
+                            border-radius: 16px;
+                            border-width: 1px;
+                            border-color: add-chip-t.has-hover ? Theme.accent : Theme.border;
+                            background: add-chip-t.has-hover ? Theme.accent-dim : transparent;
+                            animate background   { duration: 80ms; }
+                            animate border-color { duration: 80ms; }
+                            Text {
+                                text: "+ Add account";
+                                color: add-chip-t.has-hover ? Theme.accent : Theme.text-tertiary;
+                                font-size: 10px; font-weight: 500;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                animate color { duration: 80ms; }
+                            }
+                            add-chip-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.settings-google-sign-out(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Page 4: Settings ──────────────────────────────────────────────
+            if current-page == 4: VerticalLayout {
+                vertical-stretch: 1;
+
+                Rectangle {
+                    height: 48px;
+                    background: Theme.surface;
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-top: 5px;
+                        padding-bottom: 5px;
+                        spacing: 4px;
+                        alignment: start;
+                        SvgIconBtn {
+                            icon: @image-url("../assets/chevron-left.svg");
+                            clicked => { root.current-page = 0; }
+                        }
+                        Text {
+                            text: "Settings";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border; }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 0px;
+
+                        // ── Start with Windows ────────────────────────────────
+                        HorizontalLayout {
+                            padding-top: 4px;
+                            padding-bottom: 16px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 3px;
+                                Text {
+                                    text: "Start with Windows";
+                                    color: Theme.text-primary;
+                                    font-size: 13px; font-weight: 600;
+                                }
+                                Text {
+                                    text: "Launch ruscal automatically when you log in";
+                                    color: Theme.text-secondary;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            SettingsToggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: start-with-windows;
+                                toggled(v) => { root.settings-startup-changed(v); }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Theme.border; }
+
+                        // ── Sync interval ─────────────────────────────────────
+                        VerticalLayout {
+                            padding-top: 16px;
+                            padding-bottom: 4px;
+                            spacing: 10px;
+
+                            Text {
+                                text: "Sync interval";
+                                color: Theme.text-primary;
+                                font-size: 13px; font-weight: 600;
+                            }
+                            Text {
+                                text: "How often ruscal automatically syncs your calendar";
+                                color: Theme.text-secondary;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                for interval[i] in [5, 15, 30, 60]: Rectangle {
+                                    height: 36px;
+                                    horizontal-stretch: 1;
+                                    border-radius: 8px;
+                                    border-width: 1px;
+                                    border-color: sync-interval-minutes == interval
+                                        ? Theme.accent : Theme.border;
+                                    background: sync-interval-minutes == interval
+                                        ? Theme.accent-dim
+                                        : (btn-t.has-hover ? Theme.surface-elevated : Theme.surface);
+                                    animate background { duration: 100ms; }
+
+                                    Text {
+                                        text: interval < 60 ? interval + "m" : "1h";
+                                        color: sync-interval-minutes == interval
+                                            ? Theme.accent : Theme.text-secondary;
+                                        font-size: 13px; font-weight: 500;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    btn-t := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            root.sync-interval-minutes = interval;
+                                            root.settings-interval-changed(interval);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 20px; }
+                        Rectangle { height: 1px; background: Theme.border; }
+
+                        // ── Google Accounts ───────────────────────────────────
+                        VerticalLayout {
+                            padding-top: 16px;
+                            padding-bottom: 4px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "Google Accounts";
+                                color: Theme.text-primary;
+                                font-size: 13px; font-weight: 600;
+                            }
+                            Text {
+                                text: "Accounts connected for syncing";
+                                color: Theme.text-secondary;
+                                font-size: 12px;
+                            }
+
+                            // One row per connected account
+                            for acct in google-accounts: HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: acct;
+                                    color: Theme.text-primary;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                Rectangle {
+                                    width: 28px; height: 28px;
+                                    border-radius: 6px;
+                                    background: rm-t.has-hover ? #ff453a22 : transparent;
+                                    animate background { duration: 80ms; }
+                                    Image {
+                                        source: @image-url("../assets/trash.svg");
+                                        width: 13px; height: 13px;
+                                        image-fit: contain;
+                                        colorize: rm-t.has-hover ? Theme.error : Theme.text-tertiary;
+                                        animate colorize { duration: 80ms; }
+                                        x: (parent.width  - self.width)  / 2;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+                                    rm-t := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.remove-google-account(acct); }
+                                    }
+                                }
+                            }
+
+                            // "Add account" button
+                            Rectangle {
+                                height: 36px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: add-btn-t.has-hover ? Theme.accent : Theme.border;
+                                background: add-btn-t.has-hover ? Theme.accent-dim : Theme.surface;
+                                animate background   { duration: 100ms; }
+                                animate border-color { duration: 100ms; }
+                                Text {
+                                    text: "+ Add Google account";
+                                    color: add-btn-t.has-hover ? Theme.accent : Theme.text-secondary;
+                                    font-size: 12px; font-weight: 500;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    animate color { duration: 100ms; }
+                                }
+                                add-btn-t := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.add-google-account(); }
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 16px; }
+                        Rectangle { height: 1px; background: Theme.border; }
+                        Rectangle { height: 12px; }
+
+                        // ── Footer ────────────────────────────────────────────
+                        Text {
+                            text: "Config: %APPDATA%\\ruscal\\config.json";
+                            color: Theme.text-tertiary;
+                            font-size: 11px;
+                            wrap: word-wrap;
                         }
                     }
                 }
