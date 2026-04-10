@@ -85,6 +85,12 @@ pub const LID_CLIP_END: i32 = 0x8236;
 /// Maps to `iCalUID` in Google Calendar.
 pub const LID_CLEAN_GLOBAL_ID: i32 = 0x0023;
 
+/// Recurrence pattern blob (`PidLidAppointmentRecur`, `PT_BINARY`).
+///
+/// Contains the full MS-OXOCAL RecurrencePattern structure. We only parse the
+/// first 22 bytes (RecurFrequency + Period) to determine the occurrence interval.
+pub const LID_APPT_RECUR: i32 = 0x8216;
+
 // ── Resolved named property tags ──────────────────────────────────────────────
 
 /// Named property IDs resolved at session start via [`resolve`].
@@ -99,6 +105,7 @@ pub struct NamedProps {
     pub recurring:       u32,
     pub clip_end:        u32,
     pub clean_global_id: u32,
+    pub appt_recur:      u32,
 }
 
 /// Resolve named property LIDs to session-local property tags.
@@ -120,6 +127,7 @@ pub unsafe fn resolve(store: &IMsgStore) -> Result<NamedProps, crate::error::Map
         MAPINAMEID { lpguid: &mut guid_appt,    ulKind: 0, Kind: MAPINAMEID_0 { lID: LID_RECURRING       } },
         MAPINAMEID { lpguid: &mut guid_appt,    ulKind: 0, Kind: MAPINAMEID_0 { lID: LID_CLIP_END        } },
         MAPINAMEID { lpguid: &mut guid_meeting, ulKind: 0, Kind: MAPINAMEID_0 { lID: LID_CLEAN_GLOBAL_ID } },
+        MAPINAMEID { lpguid: &mut guid_appt,    ulKind: 0, Kind: MAPINAMEID_0 { lID: LID_APPT_RECUR      } },
     ];
 
     let mut ptrs: Vec<*mut MAPINAMEID> = names.iter_mut().map(|n| n as *mut _).collect();
@@ -145,6 +153,7 @@ pub unsafe fn resolve(store: &IMsgStore) -> Result<NamedProps, crate::error::Map
             recurring:       (ids[4] & 0xFFFF_0000) | PT_BOOLEAN,
             clip_end:        (ids[5] & 0xFFFF_0000) | PT_SYSTIME,
             clean_global_id: (ids[6] & 0xFFFF_0000) | PT_BINARY,
+            appt_recur:      (ids[7] & 0xFFFF_0000) | PT_BINARY,
         })
     }
 }

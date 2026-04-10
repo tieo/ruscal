@@ -39,6 +39,12 @@ pub struct CalendarEvent {
     /// It is identical across organizer + attendee copies and across all
     /// occurrences of a recurring series, making it the right key for sync.
     pub clean_global_id: Vec<u8>,
+    /// Raw `PidLidAppointmentRecur` blob (MS-OXOCAL RecurrencePattern).
+    ///
+    /// Only present on recurring series masters. The sync engine reads the
+    /// RecurFrequency and Period fields from this blob to expand the series
+    /// into individual occurrences within the sync window.
+    pub recur_blob: Vec<u8>,
 }
 
 /// The organizer's busy/free indication on their calendar.

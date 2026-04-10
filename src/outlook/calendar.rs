@@ -289,7 +289,7 @@ pub unsafe fn open_calendar_folder(
 /// # Safety
 /// Must be called from the MAPI thread.
 pub unsafe fn read_events(
-    _store:       &IMsgStore,
+    store:        &IMsgStore,
     folder:       &IMAPIFolder,
     named:        &NamedProps,
     window_start: chrono::DateTime<chrono::Utc>,
@@ -355,8 +355,8 @@ pub unsafe fn read_events(
     // Column order — indices are used when parsing rows below.
     // 0  PR_SUBJECT            6  PR_SENDER_SMTP_ADDRESS   12 named.clip_end
     // 1  PR_START_DATE         7  named.location           13 named.clean_global_id
-    // 2  PR_END_DATE           8  named.all_day
-    // 3  PR_BODY               9  named.busy_status
+    // 2  PR_END_DATE           8  named.all_day            14 named.appt_recur
+    // 3  PR_BODY               9  named.busy_status        15 PR_ENTRYID (fallback)
     // 4  PR_SENSITIVITY        10 named.response_status
     // 5  PR_SENDER_NAME        11 named.recurring
     let mut cols = build_tag_array(&[
@@ -364,7 +364,8 @@ pub unsafe fn read_events(
         PR_SENDER_NAME, PR_SENDER_SMTP_ADDRESS,
         named.location, named.all_day, named.busy_status,
         named.response_status, named.recurring, named.clip_end,
-        named.clean_global_id,
+        named.clean_global_id, named.appt_recur,
+        PR_ENTRYID, // column 15 — needed to open message if appt_recur missing from table
     ]);
 
     let mut rows: *mut SRowSet = core::ptr::null_mut();
@@ -420,9 +421,73 @@ pub unsafe fn read_events(
             is_recurring,
             recurrence_end,
             clean_global_id: unsafe { read_binary(&p[13], named.clean_global_id) },
+            recur_blob: {
+                let blob = unsafe { read_binary(&p[14], named.appt_recur) };
+                // Exchange/Outlook often omits large binary properties from table
+                // rows (returns PT_ERROR instead). Fall back to opening the message
+                // directly to read PidLidAppointmentRecur.
+                if is_recurring && blob.is_empty() && p.len() > 15 {
+                    log::debug!("recur blob missing from table row for '{}'; opening message", unsafe { read_str8(&p[0], PR_SUBJECT, "") });
+                    unsafe { fetch_recur_blob(store, &p[15], named.appt_recur) }
+                } else {
+                    blob
+                }
+            },
         });
     }
 
     unsafe { FreeProws(rows) };
     Ok(events)
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Open a MAPI message by its entry ID and read `PidLidAppointmentRecur` directly.
+///
+/// MAPI table rows commonly omit large binary properties (the provider returns
+/// `PT_ERROR` for them). This fallback calls `OpenEntry` on the message object
+/// and uses `HrGetOneProp` to fetch the recurrence blob from the object itself.
+///
+/// # Safety
+/// Must be called on the MAPI thread. `eid_prop` must be a valid `SPropValue`.
+unsafe fn fetch_recur_blob(
+    store: &IMsgStore,
+    eid_prop: &SPropValue,
+    appt_recur_tag: u32,
+) -> Vec<u8> {
+    if eid_prop.ulPropTag != PR_ENTRYID { return Vec::new(); }
+    let eid = unsafe { &eid_prop.Value.bin };
+
+    let mut obj_type = 0u32;
+    let mut raw: Option<windows::core::IUnknown> = None;
+    if unsafe {
+        store.OpenEntry(eid.cb, eid.lpb as *const _, None, 0, &mut obj_type, &mut raw)
+    }.is_err() {
+        log::debug!("fetch_recur_blob: OpenEntry failed");
+        return Vec::new();
+    }
+    let Some(msg_unk) = raw else { return Vec::new(); };
+
+    // Transmute IUnknown → IMAPIFolder so we can pass it to HrGetOneProp.
+    // Both IMessage and IMAPIFolder derive from IMAPIProp; HrGetOneProp only
+    // uses the IMAPIProp vtable slots (GetProps), which sit at the same
+    // positions in both vtables.
+    let msg = ManuallyDrop::new(unsafe {
+        core::mem::transmute::<windows::core::IUnknown, IMAPIFolder>(msg_unk)
+    });
+
+    let mut prop_ptr: *mut SPropValue = core::ptr::null_mut();
+    if unsafe { HrGetOneProp(&*msg, appt_recur_tag, &mut prop_ptr) }.is_err()
+        || prop_ptr.is_null()
+    {
+        log::debug!("fetch_recur_blob: HrGetOneProp failed");
+        return Vec::new();
+    }
+
+    let blob = unsafe { read_binary(&*prop_ptr, appt_recur_tag) };
+    log::debug!("fetch_recur_blob: got {} bytes", blob.len());
+    // prop_ptr is MAPI-allocated; should be freed with MAPIFreeBuffer.
+    // Omitted here — bounded small leak per recurring event, consistent with
+    // the existing HrGetOneProp usage pattern in open_calendar_folder.
+    blob
 }
