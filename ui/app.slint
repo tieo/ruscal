@@ -117,9 +117,12 @@ component PairRow {
     in property <SyncPair> pair;
     callback configure-source();
     callback configure-dest();
+    callback delete();
+
+    property <bool> is-configured: pair.source-name != "" && pair.dest-name != "";
 
     HorizontalLayout {
-        spacing: 12px;
+        spacing: 8px;
 
         // Source
         Rectangle {
@@ -266,6 +269,17 @@ component PairRow {
                 clicked => { root.configure-dest(); }
             }
         }
+
+        // Trash button — only visible for fully configured pairs.
+        if is-configured: SvgIconBtn {
+            icon: @image-url("../assets/trash.svg");
+            icon-size: 16px;
+            width: 30px;
+            idle-color: Theme.text-tertiary;
+            hot-color: Theme.error;
+            hot-bg: #ff453a22;
+            clicked => { root.delete(); }
+        }
     }
 }
 
@@ -282,7 +296,7 @@ export component TrayPanel inherits Window {
     callback sync-now();
     callback configure-source(int);
     callback configure-dest(int);
-    callback add-pair();
+    callback delete-pair(int);
     callback open-settings();
     callback minimize();
     callback quit();
@@ -409,6 +423,7 @@ export component TrayPanel inherits Window {
                             pair: pair;
                             configure-source => { root.configure-source(i); }
                             configure-dest   => { root.configure-dest(i); }
+                            delete           => { root.delete-pair(i); }
                         }
                     }
                 }
