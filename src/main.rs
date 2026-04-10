@@ -3,6 +3,7 @@ mod error;
 mod event;
 mod google;
 mod outlook;
+mod sync;
 
 slint::include_modules!();
 
@@ -61,6 +62,7 @@ fn main() {
             dest_name:      "".into(),
             dest_account:   "".into(),
             dest_color:     gcal_color,
+            dest_id:        "".into(),
         },
     ]));
 
@@ -69,17 +71,54 @@ fn main() {
     panel.set_last_sync_text("Synced · just now".into());
 
     panel.on_sync_now({
-        let weak = panel.as_weak();
+        let weak  = panel.as_weak();
+        let pairs = pairs_model.clone();
         move || {
             let p = weak.unwrap();
+
+            // Collect dest URLs of fully-configured pairs.
+            let dest_urls: Vec<String> = (0..pairs.row_count())
+                .filter_map(|i| pairs.row_data(i))
+                .filter(|pair| !pair.source_name.is_empty() && !pair.dest_id.is_empty())
+                .map(|pair| pair.dest_id.to_string())
+                .collect();
+
+            if dest_urls.is_empty() {
+                p.set_sync_status(SyncStatus::Idle);
+                p.set_last_sync_text("No calendars configured".into());
+                return;
+            }
+
             p.set_sync_status(SyncStatus::Syncing);
             p.set_last_sync_text("Syncing…".into());
+
             let weak2 = weak.clone();
-            slint::Timer::single_shot(std::time::Duration::from_secs(2), move || {
-                if let Some(p2) = weak2.upgrade() {
-                    p2.set_sync_status(SyncStatus::Success);
-                    p2.set_last_sync_text("Synced · just now".into());
-                }
+            std::thread::spawn(move || {
+                let result: Result<usize, String> = (|| {
+                    let token = google::get_access_token().map_err(|e| e.to_string())?;
+                    let mut total = 0usize;
+                    for dest_url in &dest_urls {
+                        total += sync::run_sync(dest_url, &token)?;
+                    }
+                    Ok(total)
+                })();
+
+                slint::invoke_from_event_loop(move || {
+                    let Some(p) = weak2.upgrade() else { return };
+                    match result {
+                        Ok(count) => {
+                            p.set_sync_status(SyncStatus::Success);
+                            p.set_last_sync_text(
+                                format!("Synced {count} events · just now").into()
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("Sync failed: {e}");
+                            p.set_sync_status(SyncStatus::Error);
+                            p.set_last_sync_text(format!("Sync error: {e}").into());
+                        }
+                    }
+                }).ok();
             });
         }
     });
@@ -218,14 +257,16 @@ fn main() {
             let Some(p) = weak.upgrade() else { return };
             let pair_index = p.get_config_pair_index() as usize;
 
-            let _cal_ids  = p.get_google_calendar_ids(); // used by sync engine later
+            let cal_ids   = p.get_google_calendar_ids();
             let calendars = p.get_google_calendars();
             let Some(summary) = calendars.row_data(cal_index as usize) else { return };
+            let dest_id = cal_ids.row_data(cal_index as usize).unwrap_or_default();
 
             let mut pair = pairs.row_data(pair_index).unwrap_or_default();
             pair.dest_name    = "Google Calendar".into();
             pair.dest_account = summary;
             pair.dest_color   = gcal_color;
+            pair.dest_id      = dest_id;
             pairs.set_row_data(pair_index, pair.clone());
 
             // Once both source and dest are configured and this was the last
@@ -241,6 +282,7 @@ fn main() {
                     dest_name:      "".into(),
                     dest_account:   "".into(),
                     dest_color:     gcal_color,
+                    dest_id:        "".into(),
                 });
             }
 
