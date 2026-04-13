@@ -131,7 +131,7 @@ pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
 /// Bring the existing running instance's window to the foreground.
 pub fn focus_existing_window() {
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOW,
     };
     use windows::core::PCWSTR;
 
@@ -141,7 +141,7 @@ pub fn focus_existing_window() {
             return;
         };
         if hwnd.is_invalid() { return; }
-        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }
 }

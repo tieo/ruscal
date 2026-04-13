@@ -93,8 +93,9 @@ fn put_with_retry(
 ) -> Result<(), caldav::CalDavError> {
     match caldav::put_event(calendar_url, uid, ical, access_token) {
         Ok(()) => Ok(()),
-        Err(e) if e.http_status() == Some(403) => {
-            log::warn!("{uid}: PUT returned 403 — cleaning stale resource(s) and retrying");
+        Err(e) if e.http_status() == Some(409) || e.http_status() == Some(403) => {
+            log::warn!("{uid}: PUT returned {} — cleaning stale resource(s) and retrying",
+                e.http_status().unwrap());
 
             // Step 1: delete our own UID-filename resource (may already be gone).
             let _ = caldav::delete_event(calendar_url, uid, access_token);
@@ -102,17 +103,15 @@ fn put_with_retry(
             // Step 2: find any server-generated hrefs for this UID and delete them.
             match caldav::find_event_hrefs_by_uid(calendar_url, uid, access_token) {
                 Ok(hrefs) => {
+                    log::warn!("{uid}: REPORT found {} conflicting href(s): {:?}", hrefs.len(), hrefs);
                     for href in &hrefs {
-                        log::info!("{uid}: deleting server-stored resource at {href}");
-                        let _ = caldav::delete_event_at_url(href, access_token);
+                        log::warn!("{uid}: deleting conflicting resource at {href}");
+                        let del = caldav::delete_event_at_url(href, access_token);
+                        log::warn!("{uid}: DELETE {href} → {:?}", del);
                     }
                 }
-                Err(e2) => log::warn!("{uid}: calendar-query REPORT failed (ignored): {e2}"),
+                Err(e2) => log::warn!("{uid}: calendar-query REPORT failed: {e2}"),
             }
-
-            // Brief pause — Google CalDAV is eventually consistent: the DELETE may
-            // take a moment to propagate before a new PUT with the same UID is accepted.
-            std::thread::sleep(std::time::Duration::from_secs(2));
 
             // Step 3: retry the PUT.
             caldav::put_event(calendar_url, uid, ical, access_token)
