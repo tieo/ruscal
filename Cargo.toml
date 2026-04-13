@@ -1,6 +1,6 @@
 [package]
 name = "ruscal"
-version = "1.0.2"
+version = "0.0.0"
 edition = "2024"
 
 [dependencies]
@@ -30,6 +30,7 @@ sha2 = "0.10"
 rand = "0.8"
 open = "5"
 dotenvy = "0.15"
+git-version = "0.3"
 roxmltree = "0.20"
 resvg = "0.44"
 slint = { version = "1", features = ["live-preview"] }
