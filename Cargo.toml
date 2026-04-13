@@ -10,6 +10,8 @@ windows = { version = "0.58", features = [
     "Win32_System_AddressBook",
     "Win32_System_Mapi",
     "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
 ] }
