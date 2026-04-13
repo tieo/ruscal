@@ -60,6 +60,12 @@ pub fn self_install(flag: Option<&str>) -> ! {
     let current = std::env::current_exe().expect("current_exe");
     std::fs::copy(&current, &installed).expect("failed to copy to install path");
 
+    // Clean up the update temp file if this process IS the update temp file.
+    // We've already copied ourselves to the installed path, so we can delete ourselves.
+    if current.file_name().map(|n| n == "ruscal_update.exe").unwrap_or(false) {
+        let _ = std::fs::remove_file(&current);
+    }
+
     let mut cmd = std::process::Command::new(&installed);
     if let Some(f) = flag {
         cmd.arg(f);
