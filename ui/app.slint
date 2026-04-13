@@ -400,7 +400,7 @@ component PairRow {
 
 export component TrayPanel inherits Window {
     title: "ruscal";
-    width: 480px;
+    width: 520px;
     min-height: 360px;
     no-frame: true;
     background: transparent;
@@ -451,9 +451,12 @@ export component TrayPanel inherits Window {
     callback remove-google-account(string); // remove a connected account
 
     // Update notification
+    in property <string> app-version: "";
     in property <string> update-version: "";
+    in-out property <bool> checking-for-update: false;
     callback update-now();
     callback dismiss-notification();
+    callback check-for-update();
 
     // Error detail
     in property <string> sync-error-detail: "";
@@ -493,13 +496,24 @@ export component TrayPanel inherits Window {
                             y: (parent.height - self.height) / 2;
                         }
 
-                        Text {
-                            text: "ruscal";
-                            color: Theme.text-primary;
-                            font-size: 16px; font-weight: 700;
-                            vertical-alignment: center;
-                            letter-spacing: -0.3px;
+                        HorizontalLayout {
                             horizontal-stretch: 0;
+                            spacing: 5px;
+                            alignment: center;
+
+                            Text {
+                                text: "ruscal";
+                                color: Theme.text-primary;
+                                font-size: 16px; font-weight: 700;
+                                vertical-alignment: center;
+                                letter-spacing: -0.3px;
+                            }
+                            Text {
+                                text: "v" + app-version;
+                                color: Theme.text-tertiary;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                            }
                         }
 
                         Rectangle {
@@ -1157,6 +1171,69 @@ export component TrayPanel inherits Window {
                                 add-btn-t := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { root.add-google-account(); }
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 20px; }
+                        Rectangle { height: 1px; background: Theme.border; }
+
+                        // ── Updates ───────────────────────────────────────────
+                        HorizontalLayout {
+                            padding-top: 16px;
+                            padding-bottom: 4px;
+                            spacing: 8px;
+
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 2px;
+                                Text {
+                                    text: "ruscal v" + app-version;
+                                    color: Theme.text-primary;
+                                    font-size: 13px; font-weight: 600;
+                                }
+                                Text {
+                                    text: update-version != "" ? "v" + update-version + " available"
+                                        : checking-for-update ? "Checking…"
+                                        : "Up to date";
+                                    color: update-version != "" ? Theme.warning : Theme.text-secondary;
+                                    font-size: 12px;
+                                }
+                            }
+
+                            Rectangle {
+                                height: 32px;
+                                width: 120px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: update-version != "" ? Theme.warning
+                                    : (settings-upd-t.has-hover ? Theme.accent : Theme.border);
+                                background: update-version != "" ? Theme.warning.with-alpha(0.12)
+                                    : (settings-upd-t.has-hover ? Theme.accent-dim : Theme.surface);
+                                animate background   { duration: 100ms; }
+                                animate border-color { duration: 100ms; }
+                                y: 8px;
+
+                                Text {
+                                    text: update-version != "" ? "Install update"
+                                        : checking-for-update ? "Checking…"
+                                        : "Check for updates";
+                                    color: update-version != "" ? Theme.warning
+                                        : (settings-upd-t.has-hover ? Theme.accent : Theme.text-secondary);
+                                    font-size: 11px; font-weight: 500;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    animate color { duration: 100ms; }
+                                }
+                                settings-upd-t := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (root.update-version != "") {
+                                            root.update-now();
+                                        } else {
+                                            root.check-for-update();
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -249,23 +249,28 @@ fn main() {
 
     let launch_args = updater::parse_args();
 
-    // Self-install: if not running from %LOCALAPPDATA%\ruscal\ruscal.exe,
-    // copy there, terminate any old instance, relaunch, exit.
-    if !updater::is_installed_path() {
-        let flag = launch_args.just_updated.as_deref()
-            .map(|v| format!("--just-updated={v}"))
-            .unwrap_or_else(|| "--just-installed".to_owned());
-        updater::self_install(Some(&flag)); // diverges — exits this process
-    }
-
-    // Single-instance guard: if ruscal is already running, bring it to front.
-    let _instance_guard = match updater::acquire_single_instance() {
-        Some(g) => g,
-        None => {
-            updater::focus_existing_window();
-            return;
+    // In debug builds, skip self-install and single-instance so `cargo run`
+    // works as a plain dev loop without touching the installed production binary.
+    #[cfg(not(debug_assertions))]
+    {
+        // Self-install: if not running from %LOCALAPPDATA%\ruscal\ruscal.exe,
+        // copy there, terminate any old instance, relaunch, exit.
+        if !updater::is_installed_path() {
+            let flag = launch_args.just_updated.as_deref()
+                .map(|v| format!("--just-updated={v}"))
+                .unwrap_or_else(|| "--just-installed".to_owned());
+            updater::self_install(Some(&flag)); // diverges — exits this process
         }
-    };
+
+        // Single-instance guard: if ruscal is already running, bring it to front.
+        let _instance_guard = match updater::acquire_single_instance() {
+            Some(g) => g,
+            None => {
+                updater::focus_existing_window();
+                return;
+            }
+        };
+    }
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(
@@ -832,6 +837,25 @@ fn main() {
         }
     });
 
+    panel.on_check_for_update({
+        let weak = panel.as_weak();
+        move || {
+            let Some(p) = weak.upgrade() else { return };
+            p.set_checking_for_update(true);
+            let weak2 = weak.clone();
+            std::thread::spawn(move || {
+                let result = updater::check_for_update();
+                slint::invoke_from_event_loop(move || {
+                    let Some(p) = weak2.upgrade() else { return };
+                    p.set_checking_for_update(false);
+                    if let Some(version) = result {
+                        p.set_update_version(version.into());
+                    }
+                }).ok();
+            });
+        }
+    });
+
     panel.on_copy_error({
         let weak = panel.as_weak();
         move || {
@@ -851,7 +875,22 @@ fn main() {
         }
     });
 
+    panel.set_app_version(env!("CARGO_PKG_VERSION").into());
     panel.show().ok();
+
+    // In debug builds, mock an error state so the error UI can be iterated
+    // without triggering a real sync.
+    #[cfg(debug_assertions)]
+    {
+        let weak = panel.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(200), move || {
+            if let Some(p) = weak.upgrade() {
+                p.set_sync_status(SyncStatus::Error);
+                p.set_sync_error_detail("CalDAV PUT: CalDAV: PUT ruscal-bee1b1da72fda14e@ruscal returned 409 Conflict: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<D:error xmlns:D=\"DAV:\"/>".into());
+                p.set_last_sync_text("Synced 5m ago · Next sync in 10m".into());
+            }
+        });
+    }
 
     // ── Background update check ────────────────────────────────────────────────
 
@@ -868,8 +907,9 @@ fn main() {
         });
     }
 
-    // ── Sync on launch (always) ───────────────────────────────────────────────
+    // ── Sync on launch (release only — dev uses mock state) ──────────────────
 
+    #[cfg(not(debug_assertions))]
     if !config.pairs.is_empty() {
         let weak_launch = panel.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(500), move || {

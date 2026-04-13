@@ -139,17 +139,6 @@ pub fn put_event(
     put_event_inner(calendar_url, uid, ical, access_token, None)
 }
 
-/// PUT with `If-Match: *` — signals an update of an already-existing resource.
-/// Used when a plain PUT returns 409 because the server enforces UID uniqueness.
-pub fn put_event_update(
-    calendar_url: &str,
-    uid:          &str,
-    ical:         &str,
-    access_token: &str,
-) -> Result<(), CalDavError> {
-    put_event_inner(calendar_url, uid, ical, access_token, Some("*"))
-}
-
 fn put_event_inner(
     calendar_url: &str,
     uid:          &str,
