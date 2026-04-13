@@ -107,6 +107,8 @@ struct AppConfig {
     last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default = "default_interval_minutes")]
     sync_interval_minutes: u64,
+    #[serde(default)]
+    browser_path: Option<String>,
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -118,10 +120,14 @@ fn config_path() -> std::path::PathBuf {
 
 fn load_config() -> AppConfig {
     let path = config_path();
-    std::fs::read_to_string(path)
+    let mut cfg: AppConfig = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if cfg.sync_interval_minutes == 0 {
+        cfg.sync_interval_minutes = default_interval_minutes();
+    }
+    cfg
 }
 
 /// Save pairs to disk. Preserves the existing `last_synced_at` and `sync_interval_minutes`
@@ -145,6 +151,7 @@ fn save_config(pairs: &VecModel<SyncPair>, new_sync_time: Option<chrono::DateTim
         pairs: saved,
         last_synced_at,
         sync_interval_minutes: existing.sync_interval_minutes,
+        browser_path: existing.browser_path,
     });
 }
 
@@ -156,6 +163,7 @@ fn save_config_vec(pairs: &[SavedPair], new_sync_time: Option<chrono::DateTime<c
         pairs: pairs.to_vec(),
         last_synced_at,
         sync_interval_minutes: existing.sync_interval_minutes,
+        browser_path: existing.browser_path,
     });
 }
 
@@ -316,6 +324,8 @@ fn main() {
     let config = load_config();
     let last_synced: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>> =
         Arc::new(Mutex::new(config.last_synced_at));
+    let browser_path: Arc<Mutex<Option<String>>> =
+        Arc::new(Mutex::new(config.browser_path.clone()));
 
     // Enable "Start with Windows" by default on first run.
     if first_run { set_autostart(true); }
@@ -348,6 +358,7 @@ fn main() {
     panel.set_sync_status(SyncStatus::Idle);
     panel.set_sync_interval_minutes(config.sync_interval_minutes.max(1) as i32);
     panel.set_start_with_windows(get_autostart());
+    panel.set_browser_path(config.browser_path.clone().unwrap_or_default().into());
 
     let stored_accounts = google::list_stored_accounts();
     panel.set_google_accounts(Rc::new(VecModel::from(
@@ -637,7 +648,9 @@ fn main() {
     // `email_hint` = Some(email) to reuse existing tokens, None to force new OAuth.
     let start_google_picker = {
         let weak = panel.as_weak();
+        let browser_path = browser_path.clone();
         move |email_hint: Option<String>| {
+            let browser = browser_path.lock().unwrap().clone();
             let Some(p) = weak.upgrade() else { return };
             p.set_google_calendars(Rc::new(VecModel::from(vec![])).into());
             p.set_google_calendar_ids(Rc::new(VecModel::from(vec![])).into());
@@ -657,7 +670,7 @@ fn main() {
 
             let weak2 = weak.clone();
             std::thread::spawn(move || {
-                let result = google::list_google_calendars(email_hint.as_deref());
+                let result = google::list_google_calendars(email_hint.as_deref(), browser.as_deref());
                 slint::invoke_from_event_loop(move || {
                     let Some(p) = weak2.upgrade() else { return };
                     // Bring the window back regardless of outcome.
@@ -723,12 +736,14 @@ fn main() {
     // "Add Google account" from Settings — OAuth without navigating away from settings.
     panel.on_add_google_account({
         let weak = panel.as_weak();
+        let browser_path = browser_path.clone();
         move || {
             let Some(p) = weak.upgrade() else { return };
             p.hide().ok();
+            let browser = browser_path.lock().unwrap().clone();
             let weak2 = weak.clone();
             std::thread::spawn(move || {
-                let result = google::authorize_new_account();
+                let result = google::authorize_new_account(browser.as_deref());
                 slint::invoke_from_event_loop(move || {
                     let Some(p) = weak2.upgrade() else { return };
                     snap_to_tray(&p);
@@ -833,6 +848,34 @@ fn main() {
                     }
                 }
             });
+        }
+    });
+
+    panel.on_browse_for_browser({
+        let weak = panel.as_weak();
+        let browser_path = browser_path.clone();
+        move || {
+            // Open a file picker via PowerShell to select an exe.
+            let result = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command",
+                    "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; \
+                     $d = New-Object System.Windows.Forms.OpenFileDialog; \
+                     $d.Filter = 'Executables (*.exe)|*.exe'; \
+                     $d.Title = 'Select browser'; \
+                     if ($d.ShowDialog() -eq 'OK') { $d.FileName }"])
+                .output();
+            if let Ok(out) = result {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !path.is_empty() {
+                    *browser_path.lock().unwrap() = Some(path.clone());
+                    let mut cfg = load_config();
+                    cfg.browser_path = Some(path.clone());
+                    let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&cfg).unwrap_or_default());
+                    if let Some(p) = weak.upgrade() {
+                        p.set_browser_path(path.into());
+                    }
+                }
+            }
         }
     });
 
