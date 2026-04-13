@@ -94,9 +94,9 @@ pub fn get_access_token_for(email: &str) -> Result<String, GoogleError> {
 /// Run a full browser OAuth flow for a new (or switched) account.
 ///
 /// Returns `(access_token, email)`. Tokens are saved to disk keyed by email.
-pub fn authorize_new_account() -> Result<(String, String), GoogleError> {
+pub fn authorize_new_account(browser_path: Option<&str>) -> Result<(String, String), GoogleError> {
     let creds = load_creds()?;
-    let (tokens, email) = auth::authorize(&creds)?;
+    let (tokens, email) = auth::authorize(&creds, browser_path)?;
     auth::save_tokens_for(&email, &tokens)?;
     Ok((tokens.access_token, email))
 }
@@ -109,14 +109,15 @@ pub fn authorize_new_account() -> Result<(String, String), GoogleError> {
 ///
 /// Returns `(calendars, email)` so the caller can record which account was used.
 pub fn list_google_calendars(
-    email_hint: Option<&str>,
+    email_hint:   Option<&str>,
+    browser_path: Option<&str>,
 ) -> Result<(Vec<GoogleCalendar>, String), GoogleError> {
     let (token, email) = match email_hint {
         Some(email) => {
             match get_access_token_for(email) {
                 Ok(token) => (token, email.to_string()),
                 // Token missing/stale — fall through to OAuth.
-                Err(_) => authorize_new_account()?,
+                Err(_) => authorize_new_account(browser_path)?,
             }
         }
         None => {
@@ -131,7 +132,7 @@ pub fn list_google_calendars(
                 auth::delete_legacy_tokens();
                 (tokens.access_token, email)
             } else {
-                authorize_new_account()?
+                authorize_new_account(browser_path)?
             }
         }
     };

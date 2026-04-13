@@ -144,7 +144,7 @@ pub fn refresh(creds: &GoogleCreds, tokens: &Tokens) -> Result<Tokens, GoogleErr
 // ── Full OAuth flow ───────────────────────────────────────────────────────────
 
 /// Run the browser-based PKCE flow. Returns `(tokens, email)`.
-pub fn authorize(creds: &GoogleCreds) -> Result<(Tokens, String), GoogleError> {
+pub fn authorize(creds: &GoogleCreds, browser_path: Option<&str>) -> Result<(Tokens, String), GoogleError> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port     = listener.local_addr()?.port();
 
@@ -169,7 +169,14 @@ pub fn authorize(creds: &GoogleCreds) -> Result<(Tokens, String), GoogleError> {
         state = state,
     );
 
-    open::that(&auth_url).map_err(|e| GoogleError::Auth(format!("cannot open browser: {e}")))?;
+    if let Some(browser) = browser_path {
+        std::process::Command::new(browser)
+            .arg(&auth_url)
+            .spawn()
+            .map_err(|e| GoogleError::Auth(format!("cannot open browser '{browser}': {e}")))?;
+    } else {
+        open::that(&auth_url).map_err(|e| GoogleError::Auth(format!("cannot open browser: {e}")))?;
+    }
 
     let code   = wait_for_code(listener, &state)?;
     let tokens = exchange_code(creds, &code, &verifier, &redirect_uri)?;
