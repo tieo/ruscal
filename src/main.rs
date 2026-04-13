@@ -4,6 +4,7 @@ mod event;
 mod google;
 mod outlook;
 mod sync;
+mod updater;
 
 slint::include_modules!();
 
@@ -246,6 +247,26 @@ fn friendly_error(e: &str) -> String {
 fn main() {
     env_logger::init();
 
+    let launch_args = updater::parse_args();
+
+    // Self-install: if not running from %LOCALAPPDATA%\ruscal\ruscal.exe,
+    // copy there, terminate any old instance, relaunch, exit.
+    if !updater::is_installed_path() {
+        let flag = launch_args.just_updated.as_deref()
+            .map(|v| format!("--just-updated={v}"))
+            .unwrap_or_else(|| "--just-installed".to_owned());
+        updater::self_install(Some(&flag)); // diverges — exits this process
+    }
+
+    // Single-instance guard: if ruscal is already running, bring it to front.
+    let _instance_guard = match updater::acquire_single_instance() {
+        Some(g) => g,
+        None => {
+            updater::focus_existing_window();
+            return;
+        }
+    };
+
     unsafe {
         let _ = SetProcessDpiAwarenessContext(
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
@@ -324,6 +345,17 @@ fn main() {
     panel.set_last_sync_text(
         status_text(*last_synced.lock().unwrap(), app_start, has_pairs, interval_secs.get()).into()
     );
+
+    // Override status line for first-run / post-update messages.
+    if launch_args.just_installed {
+        panel.set_last_sync_text(
+            "Installed — ruscal will start with Windows automatically".into()
+        );
+    } else if let Some(ref prev_ver) = launch_args.just_updated {
+        panel.set_last_sync_text(
+            format!("Updated from v{prev_ver} to v{}", env!("CARGO_PKG_VERSION")).into()
+        );
+    }
 
     // ── Sync callback ─────────────────────────────────────────────────────────
 
@@ -743,7 +775,76 @@ fn main() {
         }
     });
 
+    // ── Update callbacks ──────────────────────────────────────────────────────
+
+    panel.on_update_now({
+        let weak = panel.as_weak();
+        move || {
+            let Some(p) = weak.upgrade() else { return };
+            let version = p.get_update_version().to_string();
+            if version.is_empty() { return; }
+
+            p.set_update_version("".into());
+            p.set_last_sync_text(format!("Downloading v{version}…").into());
+
+            let weak2 = weak.clone();
+            std::thread::spawn(move || {
+                match updater::download_update(&version) {
+                    Ok(temp_path) => {
+                        // Spawn the downloaded exe — it self-installs (terminates us, copies itself).
+                        let flag = format!("--just-updated={}", env!("CARGO_PKG_VERSION"));
+                        if std::process::Command::new(&temp_path).arg(&flag).spawn().is_ok() {
+                            slint::invoke_from_event_loop(|| {
+                                slint::quit_event_loop().ok();
+                            }).ok();
+                        } else {
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(p) = weak2.upgrade() {
+                                    p.set_last_sync_text("Update failed: could not launch installer".into());
+                                    p.set_update_version(version.into());
+                                }
+                            }).ok();
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Update download failed: {e}");
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(p) = weak2.upgrade() {
+                                p.set_last_sync_text(format!("Update failed: {e}").into());
+                                p.set_update_version(version.into());
+                            }
+                        }).ok();
+                    }
+                }
+            });
+        }
+    });
+
+    panel.on_dismiss_notification({
+        let weak = panel.as_weak();
+        move || {
+            if let Some(p) = weak.upgrade() {
+                p.set_update_version("".into());
+            }
+        }
+    });
+
     panel.show().ok();
+
+    // ── Background update check ────────────────────────────────────────────────
+
+    {
+        let weak = panel.as_weak();
+        std::thread::spawn(move || {
+            if let Some(version) = updater::check_for_update() {
+                slint::invoke_from_event_loop(move || {
+                    if let Some(p) = weak.upgrade() {
+                        p.set_update_version(version.into());
+                    }
+                }).ok();
+            }
+        });
+    }
 
     // ── Sync on launch (always) ───────────────────────────────────────────────
 
