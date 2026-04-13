@@ -150,10 +150,10 @@ pub fn focus_existing_window() {
 
 /// Poll the GitHub Releases API.  Returns `Some(version)` if a newer release
 /// exists, `None` if up-to-date or the check fails (network errors are silent).
-pub fn check_for_update() -> Option<String> {
+pub fn check_for_update(current_version: &str) -> Option<String> {
     let resp = reqwest::blocking::Client::new()
         .get("https://api.github.com/repos/tieo/ruscal/releases/latest")
-        .header("User-Agent", concat!("ruscal/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", format!("ruscal/{current_version}"))
         .timeout(std::time::Duration::from_secs(8))
         .send()
         .ok()?;
@@ -165,7 +165,11 @@ pub fn check_for_update() -> Option<String> {
     let json: serde_json::Value = resp.json().ok()?;
     let latest = json["tag_name"].as_str()?.trim_start_matches('v').to_owned();
 
-    if semver_gt(&latest, env!("CARGO_PKG_VERSION")) {
+    // Strip any git-describe suffix (e.g. "1.0.3-2-gabcdef" → "1.0.3")
+    let current_clean = current_version.trim_start_matches('v')
+        .split('-').next().unwrap_or(current_version);
+
+    if semver_gt(&latest, current_clean) {
         Some(latest)
     } else {
         None

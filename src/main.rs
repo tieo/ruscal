@@ -6,6 +6,12 @@ mod outlook;
 mod sync;
 mod updater;
 
+const APP_VERSION: &str = git_version::git_version!(
+    args = ["--tags", "--match", "v*", "--always"],
+    prefix = "",
+    fallback = "dev",
+);
+
 slint::include_modules!();
 
 use std::rc::Rc;
@@ -358,7 +364,7 @@ fn main() {
         );
     } else if let Some(ref prev_ver) = launch_args.just_updated {
         panel.set_last_sync_text(
-            format!("Updated from v{prev_ver} to v{}", env!("CARGO_PKG_VERSION")).into()
+            format!("Updated from v{prev_ver} to v{}", APP_VERSION).into()
         );
     }
 
@@ -800,7 +806,7 @@ fn main() {
                 match updater::download_update(&version) {
                     Ok(temp_path) => {
                         // Spawn the downloaded exe — it self-installs (terminates us, copies itself).
-                        let flag = format!("--just-updated={}", env!("CARGO_PKG_VERSION"));
+                        let flag = format!("--just-updated={}", APP_VERSION);
                         if std::process::Command::new(&temp_path).arg(&flag).spawn().is_ok() {
                             slint::invoke_from_event_loop(|| {
                                 slint::quit_event_loop().ok();
@@ -852,7 +858,7 @@ fn main() {
             p.set_checking_for_update(true);
             let weak2 = weak.clone();
             std::thread::spawn(move || {
-                let result = updater::check_for_update();
+                let result = updater::check_for_update(APP_VERSION);
                 slint::invoke_from_event_loop(move || {
                     let Some(p) = weak2.upgrade() else { return };
                     p.set_checking_for_update(false);
@@ -883,29 +889,16 @@ fn main() {
         }
     });
 
-    panel.set_app_version(env!("CARGO_PKG_VERSION").into());
+    panel.set_app_version(APP_VERSION.into());
     panel.show().ok();
 
-    // In debug builds, mock an error state so the error UI can be iterated
-    // without triggering a real sync.
-    #[cfg(debug_assertions)]
-    {
-        let weak = panel.as_weak();
-        slint::Timer::single_shot(std::time::Duration::from_millis(200), move || {
-            if let Some(p) = weak.upgrade() {
-                p.set_sync_status(SyncStatus::Error);
-                p.set_sync_error_detail("CalDAV PUT: CalDAV: PUT ruscal-bee1b1da72fda14e@ruscal returned 409 Conflict: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<D:error xmlns:D=\"DAV:\"/>".into());
-                p.set_last_sync_text("Synced 5m ago · Next sync in 10m".into());
-            }
-        });
-    }
 
     // ── Background update check ────────────────────────────────────────────────
 
     {
         let weak = panel.as_weak();
         std::thread::spawn(move || {
-            if let Some(version) = updater::check_for_update() {
+            if let Some(version) = updater::check_for_update(APP_VERSION) {
                 slint::invoke_from_event_loop(move || {
                     if let Some(p) = weak.upgrade() {
                         p.set_update_version(version.into());
