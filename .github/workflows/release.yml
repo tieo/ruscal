@@ -36,6 +36,9 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build release binary
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Generate changelog

@@ -42,27 +42,15 @@ impl From<serde_json::Error> for GoogleError { fn from(e: serde_json::Error) -> 
 // ── Credential loading ────────────────────────────────────────────────────────
 
 fn load_creds() -> Result<GoogleCreds, GoogleError> {
-    let path = dirs::config_dir()
-        .ok_or_else(|| GoogleError::Config("cannot locate config directory".into()))?
-        .join("ruscal")
-        .join(".env");
-
-    dotenvy::from_path(&path).map_err(|_| {
-        GoogleError::Config(format!(
-            "credentials file not found at {}.\n\
-             Create it with:\n\
-             GOOGLE_CLIENT_ID=<your-client-id>\n\
-             GOOGLE_CLIENT_SECRET=<your-client-secret>",
-            path.display()
-        ))
-    })?;
-
-    let client_id = std::env::var("GOOGLE_CLIENT_ID")
-        .map_err(|_| GoogleError::Config("GOOGLE_CLIENT_ID not set in .env".into()))?;
-    let client_secret = std::env::var("GOOGLE_CLIENT_SECRET")
-        .map_err(|_| GoogleError::Config("GOOGLE_CLIENT_SECRET not set in .env".into()))?;
-
-    Ok(GoogleCreds { client_id, client_secret })
+    let client_id = option_env!("GOOGLE_CLIENT_ID")
+        .ok_or_else(|| GoogleError::Config(
+            "GOOGLE_CLIENT_ID not set at build time".into()
+        ))?;
+    let client_secret = option_env!("GOOGLE_CLIENT_SECRET")
+        .ok_or_else(|| GoogleError::Config(
+            "GOOGLE_CLIENT_SECRET not set at build time".into()
+        ))?;
+    Ok(GoogleCreds { client_id: client_id.to_owned(), client_secret: client_secret.to_owned() })
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
