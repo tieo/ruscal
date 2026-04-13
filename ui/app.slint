@@ -270,14 +270,14 @@ component PairRow {
                     spacing: 2px;
                     horizontal-stretch: 1;
                     Text {
-                        text: pair.source-name;
+                        text: "Outlook";
                         color: pair.source-color;
                         font-size: 13px; font-weight: 600;
                         overflow: elide;
                     }
-                    if pair.source-account != "": Text {
+                    Text {
                         text: pair.source-account;
-                        color: Theme.text-tertiary;
+                        color: Theme.text-secondary;
                         font-size: 11px;
                         overflow: elide;
                     }
@@ -359,14 +359,14 @@ component PairRow {
                     spacing: 2px;
                     horizontal-stretch: 1;
                     Text {
-                        text: pair.dest-name;
+                        text: "Google";
                         color: pair.dest-color;
                         font-size: 13px; font-weight: 600;
                         overflow: elide;
                     }
-                    if pair.dest-account != "": Text {
-                        text: pair.dest-account;
-                        color: Theme.text-tertiary;
+                    Text {
+                        text: pair.dest-name;
+                        color: Theme.text-secondary;
                         font-size: 11px;
                         overflow: elide;
                     }
@@ -455,6 +455,12 @@ export component TrayPanel inherits Window {
     callback update-now();
     callback dismiss-notification();
 
+    // Error detail
+    in property <string> sync-error-detail: "";
+    in-out property <bool> show-error-detail: false;
+    in-out property <bool> error-copy-done: false;
+    callback copy-error();
+
     Rectangle {
         width: 100%;
         height: 100%;
@@ -474,16 +480,16 @@ export component TrayPanel inherits Window {
                 HorizontalLayout {
                     padding-left: 16px;
                     padding-right: 6px;
-                    alignment: space-between;
 
                     HorizontalLayout {
+                        horizontal-stretch: 1;
                         spacing: 10px;
-                        alignment: start;
 
                         Image {
                             source: @image-url("../assets/icon.svg");
                             width: 26px; height: 26px;
                             image-fit: contain;
+                            vertical-stretch: 0;
                             y: (parent.height - self.height) / 2;
                         }
 
@@ -493,41 +499,71 @@ export component TrayPanel inherits Window {
                             font-size: 16px; font-weight: 700;
                             vertical-alignment: center;
                             letter-spacing: -0.3px;
+                            horizontal-stretch: 0;
                         }
 
                         Rectangle {
                             width: 1px; height: 16px;
                             background: Theme.border;
+                            horizontal-stretch: 0;
                             y: (parent.height - self.height) / 2;
                         }
 
                         SyncIndicator {
                             status: sync-status;
+                            horizontal-stretch: 0;
                             y: (parent.height - self.height) / 2;
                             clicked => { root.sync-now(); }
                         }
 
+                        if sync-status == SyncStatus.Error: Rectangle {
+                            width: 18px; height: 18px;
+                            border-radius: 9px;
+                            background: Theme.error;
+                            horizontal-stretch: 0;
+                            y: (parent.height - self.height) / 2;
+
+                            Text {
+                                text: "!";
+                                color: #ffffff;
+                                font-size: 11px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            err-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.show-error-detail = true; }
+                            }
+                        }
+
                         Text {
                             text: last-sync-text;
-                            color: sync-status == SyncStatus.Error ? Theme.error : Theme.text-secondary;
+                            color: Theme.text-secondary;
                             font-size: 13px;
                             vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
                         }
                     }
 
                     HorizontalLayout {
+                        horizontal-stretch: 0;
                         spacing: 0px;
-                        alignment: center;
 
                         SvgIconBtn {
+                            y: (parent.height - self.height) / 2;
                             icon: @image-url("../assets/settings.svg");
                             clicked => { root.open-settings(); }
                         }
                         SvgIconBtn {
+                            y: (parent.height - self.height) / 2;
                             icon: @image-url("../assets/minimize.svg");
                             clicked => { root.minimize(); }
                         }
                         SvgIconBtn {
+                            y: (parent.height - self.height) / 2;
                             icon: @image-url("../assets/close.svg");
                             hot-color: Theme.error;
                             hot-bg: #ff453a22;
@@ -753,7 +789,7 @@ export component TrayPanel inherits Window {
                             y: (parent.height - self.height) / 2;
                         }
                         Text {
-                            text: "Google Calendar";
+                            text: "Google";
                             color: Theme.text-primary;
                             font-size: 13px;
                             vertical-alignment: center;
@@ -1135,6 +1171,127 @@ export component TrayPanel inherits Window {
                             color: Theme.text-tertiary;
                             font-size: 11px;
                             wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Error detail overlay ──────────────────────────────────────────────
+        if show-error-detail: Rectangle {
+            width: 100%; height: 100%;
+            background: #000000aa;
+
+            Rectangle {
+                width: 360px;
+                height: 248px;
+                x: (parent.width  - self.width)  / 2;
+                y: (parent.height - self.height) / 2;
+                border-radius: 14px;
+                background: Theme.surface-elevated;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 14px;
+
+                    HorizontalLayout {
+                        alignment: space-between;
+                        Text {
+                            text: "Sync error";
+                            color: Theme.error;
+                            font-size: 14px; font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: 28px; height: 28px;
+                            border-radius: 6px;
+                            background: close-err-t.has-hover ? Theme.surface : transparent;
+                            animate background { duration: 80ms; }
+                            Text {
+                                text: "×";
+                                color: Theme.text-secondary;
+                                font-size: 16px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            close-err-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.show-error-detail = false; }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 130px;
+                        border-radius: 8px;
+                        background: Theme.background;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        clip: true;
+
+                        ScrollView {
+                            width: parent.width;
+                            height: parent.height;
+                            viewport-width: parent.width - 24px;
+                            VerticalLayout {
+                                padding: 10px;
+                                Text {
+                                    text: sync-error-detail;
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Rectangle {
+                            height: 34px;
+                            horizontal-stretch: 1;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: error-copy-done ? Theme.success : Theme.border;
+                            background: error-copy-done ? Theme.success.with-alpha(0.15)
+                                      : (copy-t.has-hover ? Theme.border : Theme.surface);
+                            animate background   { duration: 80ms; }
+                            animate border-color { duration: 80ms; }
+                            Text {
+                                text: error-copy-done ? "Copied!" : "Copy";
+                                color: error-copy-done ? Theme.success : Theme.text-secondary;
+                                font-size: 12px; font-weight: 500;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                animate color { duration: 80ms; }
+                            }
+                            copy-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.copy-error(); }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 34px;
+                            horizontal-stretch: 1;
+                            border-radius: 8px;
+                            background: dismiss-err-t.has-hover ? Theme.error : #ff453a44;
+                            animate background { duration: 80ms; }
+                            Text {
+                                text: "Dismiss";
+                                color: dismiss-err-t.has-hover ? #ffffff : Theme.error;
+                                font-size: 12px; font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                animate color { duration: 80ms; }
+                            }
+                            dismiss-err-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.show-error-detail = false; }
+                            }
                         }
                     }
                 }

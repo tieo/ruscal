@@ -136,13 +136,36 @@ pub fn put_event(
     ical:         &str,
     access_token: &str,
 ) -> Result<(), CalDavError> {
+    put_event_inner(calendar_url, uid, ical, access_token, None)
+}
+
+/// PUT with `If-Match: *` — signals an update of an already-existing resource.
+/// Used when a plain PUT returns 409 because the server enforces UID uniqueness.
+pub fn put_event_update(
+    calendar_url: &str,
+    uid:          &str,
+    ical:         &str,
+    access_token: &str,
+) -> Result<(), CalDavError> {
+    put_event_inner(calendar_url, uid, ical, access_token, Some("*"))
+}
+
+fn put_event_inner(
+    calendar_url: &str,
+    uid:          &str,
+    ical:         &str,
+    access_token: &str,
+    if_match:     Option<&str>,
+) -> Result<(), CalDavError> {
     let url  = format!("{}/{uid}.ics", calendar_url.trim_end_matches('/'));
-    let resp = client()
+    let mut req = client()
         .put(&url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-        .body(ical.to_owned())
-        .send()?;
+        .header(CONTENT_TYPE, "text/calendar; charset=utf-8");
+    if let Some(etag) = if_match {
+        req = req.header("If-Match", etag);
+    }
+    let resp = req.body(ical.to_owned()).send()?;
 
     let status = resp.status();
     if !status.is_success() {

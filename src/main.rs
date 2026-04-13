@@ -430,7 +430,10 @@ fn main() {
                         Err(ref e) => {
                             log::error!("Sync failed: {e}");
                             p.set_sync_status(SyncStatus::Error);
-                            p.set_last_sync_text(friendly_error(e).into());
+                            p.set_sync_error_detail(e.as_str().into());
+                            p.set_last_sync_text(
+                                status_text(*last_synced.lock().unwrap(), app_start, true, secs).into()
+                            );
                         }
                     }
                 }).ok();
@@ -826,6 +829,25 @@ fn main() {
             if let Some(p) = weak.upgrade() {
                 p.set_update_version("".into());
             }
+        }
+    });
+
+    panel.on_copy_error({
+        let weak = panel.as_weak();
+        move || {
+            let Some(p) = weak.upgrade() else { return };
+            let text = p.get_sync_error_detail().to_string();
+            if text.is_empty() { return; }
+            let escaped = text.replace('\'', "''");
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command",
+                       &format!("Set-Clipboard -Value '{escaped}'")])
+                .output();
+            p.set_error_copy_done(true);
+            let weak2 = weak.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
+                if let Some(p) = weak2.upgrade() { p.set_error_copy_done(false); }
+            });
         }
     });
 
