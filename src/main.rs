@@ -362,11 +362,11 @@ fn main() {
     // Override status line for first-run / post-update messages.
     if launch_args.just_installed {
         panel.set_last_sync_text(
-            "Installed — ruscal will start with Windows automatically".into()
+            "Installed · starts with Windows".into()
         );
     } else if let Some(ref prev_ver) = launch_args.just_updated {
         panel.set_last_sync_text(
-            format!("Updated from v{prev_ver} to v{}", APP_VERSION).into()
+            format!("Updated to {}", APP_VERSION).into()
         );
     }
 
