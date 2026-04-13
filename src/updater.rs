@@ -64,6 +64,12 @@ pub fn self_install(flag: Option<&str>) -> ! {
     if let Some(f) = flag {
         cmd.arg(f);
     }
+    // CREATE_NO_WINDOW prevents a console flash when spawning the installed GUI exe.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     cmd.spawn().expect("failed to launch installed exe");
 
     std::process::exit(0);
