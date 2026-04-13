@@ -449,6 +449,7 @@ export component TrayPanel inherits Window {
     callback settings-startup-changed(bool);
     callback add-google-account();          // add a new account from settings
     callback remove-google-account(string); // remove a connected account
+    callback open-config-dir();
 
     // Update notification
     in property <string> app-version: "";
@@ -1243,11 +1244,18 @@ export component TrayPanel inherits Window {
                         Rectangle { height: 12px; }
 
                         // ── Footer ────────────────────────────────────────────
-                        Text {
-                            text: "Config: %APPDATA%\\ruscal\\config.json";
-                            color: Theme.text-tertiary;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                        Rectangle {
+                            Text {
+                                text: "Config: %LOCALAPPDATA%\\ruscal\\";
+                                color: cfg-t.has-hover ? Theme.accent : Theme.text-tertiary;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                                animate color { duration: 80ms; }
+                            }
+                            cfg-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-config-dir(); }
+                            }
                         }
                     }
                 }

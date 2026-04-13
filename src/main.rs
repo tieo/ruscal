@@ -102,7 +102,7 @@ struct AppConfig {
 }
 
 fn config_path() -> std::path::PathBuf {
-    dirs::config_dir()
+    dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("ruscal")
         .join("config.json")
@@ -825,6 +825,14 @@ fn main() {
                     }
                 }
             });
+        }
+    });
+
+    panel.on_open_config_dir(|| {
+        if let Some(dir) = dirs::data_local_dir() {
+            let _ = std::process::Command::new("explorer")
+                .arg(dir.join("ruscal"))
+                .spawn();
         }
     });
 

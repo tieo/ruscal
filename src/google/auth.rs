@@ -38,7 +38,7 @@ impl Tokens {
 // ── Token persistence (per-account) ──────────────────────────────────────────
 
 fn tokens_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("ruscal").join("tokens"))
+    dirs::data_local_dir().map(|d| d.join("ruscal").join("tokens"))
 }
 
 fn token_path_for(email: &str) -> Option<PathBuf> {
@@ -48,7 +48,7 @@ fn token_path_for(email: &str) -> Option<PathBuf> {
 
 /// Legacy single-account path — kept for migration only.
 pub fn legacy_token_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("ruscal").join("google_token.json"))
+    dirs::data_local_dir().map(|d| d.join("ruscal").join("google_token.json"))
 }
 
 pub fn load_tokens_for(email: &str) -> Option<Tokens> {

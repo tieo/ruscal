@@ -1,2 +1,5 @@
 /target
 .cargo/config.toml
+.env
+debug_events.txt
+debug_pipeline_report.txt
