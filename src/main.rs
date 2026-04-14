@@ -425,31 +425,35 @@ fn main() {
             let weak2 = weak.clone();
             let last_synced = last_synced.clone();
             std::thread::spawn(move || {
-                let result: Result<usize, String> = (|| {
-                    let mut total = 0usize;
+                let result: Result<(usize, Vec<String>), String> = (|| {
+                    let mut synced  = 0usize;
+                    let mut skipped_titles: Vec<String> = Vec::new();
                     for (dest_url, google_email) in &sync_targets {
                         let token = google::get_access_token_for(google_email)
                             .map_err(|e| e.to_string())?;
-                        total += sync::run_sync(dest_url, &token)?;
+                        let report = sync::run_sync(dest_url, &token)?;
+                        synced  += report.synced;
+                        skipped_titles.extend(report.skipped_titles);
                     }
-                    Ok(total)
+                    Ok((synced, skipped_titles))
                 })();
 
                 slint::invoke_from_event_loop(move || {
                     let Some(p) = weak2.upgrade() else { return };
                     match result {
-                        Ok(count) => {
+                        Ok((_synced, skipped_titles)) => {
                             let now = chrono::Utc::now();
                             *last_synced.lock().unwrap() = Some(now);
                             save_config_vec(&saved_pairs, Some(now));
                             p.set_sync_status(SyncStatus::Success);
+                            p.set_skipped_count(skipped_titles.len() as i32);
+                            p.set_skipped_detail(skipped_titles.join("\n").into());
                             p.set_last_sync_text(
                                 format!("{} · {}",
                                     format_last_sync(now),
                                     format_next_sync(Some(now), app_start, secs),
                                 ).into()
                             );
-                            let _ = count; // surfaced in status line via last_sync
                         }
                         Err(ref e) => {
                             log::error!("Sync failed: {e}");
@@ -953,9 +957,8 @@ fn main() {
         });
     }
 
-    // ── Sync on launch (release only — dev uses mock state) ──────────────────
+    // ── Sync on launch ────────────────────────────────────────────────────────
 
-    #[cfg(not(debug_assertions))]
     if !config.pairs.is_empty() {
         let weak_launch = panel.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(500), move || {

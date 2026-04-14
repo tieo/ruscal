@@ -465,6 +465,11 @@ export component TrayPanel inherits Window {
     callback dismiss-notification();
     callback check-for-update();
 
+    // Count of events skipped on the last sync (409/403 conflicts). 0 = hide badge.
+    in property <int> skipped-count: 0;
+    in property <string> skipped-detail: "";
+    in-out property <bool> show-skipped-detail: false;
+
     // Error detail
     in property <string> sync-error-detail: "";
     in-out property <bool> show-error-detail: false;
@@ -556,6 +561,32 @@ export component TrayPanel inherits Window {
                             err-ta := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => { root.show-error-detail = true; }
+                            }
+                        }
+
+                        // Amber skipped-count badge: shown after a successful sync that
+                        // had 409/403 conflicts. Hidden on error (the error badge is louder).
+                        if sync-status != SyncStatus.Error && skipped-count > 0: Rectangle {
+                            height: 18px;
+                            width: skipped-text.preferred-width + 14px;
+                            border-radius: 9px;
+                            background: skipped-ta.has-hover ? #b45309 : #d97706;
+                            animate background { duration: 80ms; }
+                            horizontal-stretch: 0;
+                            y: (parent.height - self.height) / 2;
+
+                            skipped-text := Text {
+                                text: skipped-count + (skipped-count == 1 ? " skipped" : " skipped");
+                                color: #ffffff;
+                                font-size: 11px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            skipped-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.show-skipped-detail = true; }
                             }
                         }
 
@@ -1431,6 +1462,86 @@ export component TrayPanel inherits Window {
                             dismiss-err-t := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => { root.show-error-detail = false; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Skipped events detail overlay ─────────────────────────────────────
+        if show-skipped-detail: Rectangle {
+            width: 100%; height: 100%;
+            background: #000000aa;
+
+            Rectangle {
+                width: 360px;
+                height: 248px;
+                x: (parent.width  - self.width)  / 2;
+                y: (parent.height - self.height) / 2;
+                border-radius: 14px;
+                background: Theme.surface-elevated;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 14px;
+
+                    HorizontalLayout {
+                        alignment: space-between;
+                        Text {
+                            text: skipped-count + " event" + (skipped-count == 1 ? "" : "s") + " skipped";
+                            color: #d97706;
+                            font-size: 14px; font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: 28px; height: 28px;
+                            border-radius: 6px;
+                            background: close-skip-t.has-hover ? Theme.surface : transparent;
+                            animate background { duration: 80ms; }
+                            Text {
+                                text: "×";
+                                color: Theme.text-secondary;
+                                font-size: 16px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            close-skip-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.show-skipped-detail = false; }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "These events already exist on the target calendar and couldn't be overwritten (409/403). Delete the duplicates in Google Calendar to let ruscal manage them.";
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        border-radius: 8px;
+                        background: Theme.background;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        clip: true;
+
+                        ScrollView {
+                            width: parent.width;
+                            height: parent.height;
+                            viewport-width: parent.width - 24px;
+                            VerticalLayout {
+                                padding: 10px;
+                                Text {
+                                    text: skipped-detail;
+                                    color: Theme.text-primary;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
                             }
                         }
                     }
