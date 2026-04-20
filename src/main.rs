@@ -5,6 +5,7 @@ mod error;
 mod event;
 mod google;
 mod outlook;
+mod state;
 mod sync;
 mod updater;
 
@@ -109,6 +110,18 @@ struct AppConfig {
     sync_interval_minutes: u64,
     #[serde(default)]
     browser_path: Option<String>,
+    /// Whether ruscal should launch hidden to the tray on startup.
+    ///
+    /// `None` means "never configured" — we treat that as the default-on state
+    /// so fresh installs start minimized without requiring a config write on
+    /// first launch.
+    #[serde(default)]
+    start_minimized: Option<bool>,
+}
+
+/// Effective value of the start-minimized setting with its default (`true`) applied.
+fn start_minimized_effective(cfg: &AppConfig) -> bool {
+    cfg.start_minimized.unwrap_or(true)
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -152,6 +165,7 @@ fn save_config(pairs: &VecModel<SyncPair>, new_sync_time: Option<chrono::DateTim
         last_synced_at,
         sync_interval_minutes: existing.sync_interval_minutes,
         browser_path: existing.browser_path,
+        start_minimized: existing.start_minimized,
     });
 }
 
@@ -164,6 +178,7 @@ fn save_config_vec(pairs: &[SavedPair], new_sync_time: Option<chrono::DateTime<c
         last_synced_at,
         sync_interval_minutes: existing.sync_interval_minutes,
         browser_path: existing.browser_path,
+        start_minimized: existing.start_minimized,
     });
 }
 
@@ -171,6 +186,13 @@ fn save_config_vec(pairs: &[SavedPair], new_sync_time: Option<chrono::DateTime<c
 fn save_interval(minutes: u64) {
     let mut config = load_config();
     config.sync_interval_minutes = minutes;
+    write_config(config);
+}
+
+/// Save the start-minimized toggle, preserving everything else.
+fn save_start_minimized(enabled: bool) {
+    let mut config = load_config();
+    config.start_minimized = Some(enabled);
     write_config(config);
 }
 
@@ -264,6 +286,7 @@ fn main() {
     env_logger::init();
 
     let launch_args = updater::parse_args();
+    updater::cleanup_stale_update_exe();
 
     // In debug builds, skip self-install and single-instance so `cargo run`
     // works as a plain dev loop without touching the installed production binary.
@@ -358,6 +381,7 @@ fn main() {
     panel.set_sync_status(SyncStatus::Idle);
     panel.set_sync_interval_minutes(config.sync_interval_minutes.max(1) as i32);
     panel.set_start_with_windows(get_autostart());
+    panel.set_start_minimized(start_minimized_effective(&config));
     panel.set_browser_path(config.browser_path.clone().unwrap_or_default().into());
 
     let stored_accounts = google::list_stored_accounts();
@@ -375,7 +399,7 @@ fn main() {
         panel.set_last_sync_text(
             "Installed · starts with Windows".into()
         );
-    } else if let Some(ref prev_ver) = launch_args.just_updated {
+    } else if launch_args.just_updated.is_some() {
         panel.set_last_sync_text(
             format!("Updated to {}", APP_VERSION).into()
         );
@@ -394,10 +418,14 @@ fn main() {
 
             // Collect (dest_url, google_email) for each configured pair.
             // dest_account in Slint holds the google email.
-            let sync_targets: Vec<(String, String)> = (0..pairs.row_count())
+            let sync_targets: Vec<(String, String, String)> = (0..pairs.row_count())
                 .filter_map(|i| pairs.row_data(i))
                 .filter(|pair| !pair.source_name.is_empty() && !pair.dest_id.is_empty())
-                .map(|pair| (pair.dest_id.to_string(), pair.dest_account.to_string()))
+                .map(|pair| (
+                    state::pair_id(&pair.source_account, &pair.dest_id),
+                    pair.dest_id.to_string(),
+                    pair.dest_account.to_string(),
+                ))
                 .collect();
 
             if sync_targets.is_empty() {
@@ -428,10 +456,10 @@ fn main() {
                 let result: Result<(usize, Vec<String>), String> = (|| {
                     let mut synced  = 0usize;
                     let mut skipped_titles: Vec<String> = Vec::new();
-                    for (dest_url, google_email) in &sync_targets {
+                    for (pair_id, dest_url, google_email) in &sync_targets {
                         let token = google::get_access_token_for(google_email)
                             .map_err(|e| e.to_string())?;
-                        let report = sync::run_sync(dest_url, &token)?;
+                        let report = sync::run_sync(pair_id, dest_url, &token)?;
                         synced  += report.synced;
                         skipped_titles.extend(report.skipped_titles);
                     }
@@ -939,7 +967,29 @@ fn main() {
     });
 
     panel.set_app_version(APP_VERSION.into());
+
+    // The window must be shown at least once — Slint's event loop exits if no
+    // window is ever realised. When start-minimized is on, we defer a
+    // `hide()` via a single-shot timer so the hide runs *inside* the event
+    // loop; calling it before the loop starts would race with the window's
+    // realisation and cause the process to exit immediately.
+    //
+    // The window is always surfaced on notable first-impression events —
+    // first run (setup wizard), fresh install, or just-updated — so the user
+    // gets visible confirmation regardless of the setting.
     panel.show().ok();
+
+    let force_show =
+        first_run
+        || launch_args.just_installed
+        || launch_args.just_updated.is_some();
+
+    if !force_show && start_minimized_effective(&config) {
+        let weak = panel.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+            if let Some(p) = weak.upgrade() { p.hide().ok(); }
+        });
+    }
 
 
     // ── Background update check ────────────────────────────────────────────────
@@ -1042,6 +1092,10 @@ fn main() {
 
     panel.on_settings_startup_changed(|enable| {
         set_autostart(enable);
+    });
+
+    panel.on_settings_start_minimized_changed(|enable| {
+        save_start_minimized(enable);
     });
 
 

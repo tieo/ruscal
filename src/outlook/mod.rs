@@ -164,3 +164,50 @@ unsafe fn read_calendar_inner(
 
     Ok(events)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the CP1252 umlaut bug.
+    ///
+    /// Outlook returns `PT_STRING8` properties in the system ANSI code page
+    /// (CP1252 on Western Windows). An earlier implementation interpreted the
+    /// bytes directly as UTF-8, producing `U+FFFD REPLACEMENT CHARACTER` for
+    /// any codepoint above 0x7F (ä/ö/ü/ß/…). The fix switches to the
+    /// `PT_UNICODE` (`_W`) tag variants so Outlook returns UTF-16 directly.
+    ///
+    /// This test asserts that **no** event subject / body / organizer name
+    /// contains `U+FFFD` — the unambiguous signature of the previous bug.
+    ///
+    /// Run with: `cargo test --lib outlook::tests::subjects_have_no_replacement_char -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a running Outlook profile on the host"]
+    fn subjects_have_no_replacement_char() {
+        let now = chrono::Utc::now();
+        let window_start = now - chrono::Duration::days(DEFAULT_PAST_DAYS);
+        let window_end   = now + chrono::Duration::days(DEFAULT_FUTURE_DAYS);
+
+        let events = read_calendar_events(window_start, window_end)
+            .expect("MAPI read should succeed");
+
+        assert!(!events.is_empty(), "no events in the current sync window");
+
+        let offenders: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.subject.contains('\u{FFFD}')
+                    || e.body.contains('\u{FFFD}')
+                    || e.organizer_name.contains('\u{FFFD}')
+            })
+            .map(|e| e.subject.clone())
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "{} event(s) still contain U+FFFD — CP1252 decode is broken: {:?}",
+            offenders.len(),
+            offenders,
+        );
+    }
+}

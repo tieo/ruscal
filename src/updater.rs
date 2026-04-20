@@ -212,6 +212,22 @@ pub fn download_update(version: &str) -> Result<PathBuf, String> {
     Ok(temp)
 }
 
+/// Remove a leftover `ruscal_update.exe` from a prior self-install run.
+///
+/// The self-install path already deletes the temp when it's the running exe,
+/// but if the user later launches ruscal a different way (explorer, autostart)
+/// the stale temp can linger. Call this on startup — no-op if absent or if
+/// this process happens to be running from that path.
+pub fn cleanup_stale_update_exe() {
+    let Some(temp) = dirs::data_local_dir()
+        .map(|d| d.join("ruscal").join("ruscal_update.exe")) else { return };
+    if !temp.exists() { return; }
+    if let Ok(cur) = std::env::current_exe() {
+        if cur == temp { return; }
+    }
+    let _ = std::fs::remove_file(&temp);
+}
+
 fn semver_gt(a: &str, b: &str) -> bool {
     fn parse(s: &str) -> (u32, u32, u32) {
         let mut it = s.splitn(3, '.').map(|p| p.parse::<u32>().unwrap_or(0));
