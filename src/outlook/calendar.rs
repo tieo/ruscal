@@ -32,9 +32,9 @@ use windows::Win32::System::AddressBook::{
 use super::props::{
     self, build_tag_array, datetime_to_filetime, read_binary, read_bool,
     read_filetime, read_long, read_str8, read_unicode,
-    NamedProps, PR_BODY, PR_CONTAINER_CLASS, PR_DISPLAY_NAME, PR_DISPLAY_NAME_W,
-    PR_END_DATE, PR_ENTRYID, PR_IPM_SUBTREE_ENTRYID, PR_SENDER_NAME,
-    PR_SENDER_SMTP_ADDRESS, PR_SENSITIVITY, PR_START_DATE, PR_SUBJECT,
+    NamedProps, PR_BODY_W, PR_CONTAINER_CLASS, PR_DISPLAY_NAME, PR_DISPLAY_NAME_W,
+    PR_END_DATE, PR_ENTRYID, PR_IPM_SUBTREE_ENTRYID, PR_SENDER_NAME_W,
+    PR_SENDER_SMTP_ADDRESS, PR_SENSITIVITY, PR_START_DATE, PR_SUBJECT_W,
 };
 use super::session::IMAPISession;
 use crate::error::{check_hr, MapiError};
@@ -353,15 +353,20 @@ pub unsafe fn read_events(
         .map_err(|e| MapiError(e.code().0 as u32))?;
 
     // Column order — indices are used when parsing rows below.
-    // 0  PR_SUBJECT            6  PR_SENDER_SMTP_ADDRESS   12 named.clip_end
+    // 0  PR_SUBJECT_W          6  PR_SENDER_SMTP_ADDRESS   12 named.clip_end
     // 1  PR_START_DATE         7  named.location           13 named.clean_global_id
     // 2  PR_END_DATE           8  named.all_day            14 named.appt_recur
-    // 3  PR_BODY               9  named.busy_status        15 PR_ENTRYID (fallback)
+    // 3  PR_BODY_W             9  named.busy_status        15 PR_ENTRYID (fallback)
     // 4  PR_SENSITIVITY        10 named.response_status
-    // 5  PR_SENDER_NAME        11 named.recurring
+    // 5  PR_SENDER_NAME_W      11 named.recurring
+    //
+    // We request the PT_UNICODE (_W) variants so Outlook returns proper UTF-16
+    // strings. The ANSI (PT_STRING8) variants return CP1252 bytes on Western
+    // Windows, which we were previously mis-decoding as UTF-8 — mangling
+    // umlauts (ä/ö/ü/ß) into U+FFFD replacement characters on the Google side.
     let mut cols = build_tag_array(&[
-        PR_SUBJECT, PR_START_DATE, PR_END_DATE, PR_BODY, PR_SENSITIVITY,
-        PR_SENDER_NAME, PR_SENDER_SMTP_ADDRESS,
+        PR_SUBJECT_W, PR_START_DATE, PR_END_DATE, PR_BODY_W, PR_SENSITIVITY,
+        PR_SENDER_NAME_W, PR_SENDER_SMTP_ADDRESS,
         named.location, named.all_day, named.busy_status,
         named.response_status, named.recurring, named.clip_end,
         named.clean_global_id, named.appt_recur,
@@ -407,12 +412,12 @@ pub unsafe fn read_events(
         };
 
         events.push(CalendarEvent {
-            subject:         unsafe { read_str8(&p[0],    PR_SUBJECT,              "(no subject)") },
+            subject:         unsafe { read_unicode(&p[0],  PR_SUBJECT_W,            "(no subject)") },
             start:           unsafe { read_filetime(&p[1], PR_START_DATE) },
             end:             unsafe { read_filetime(&p[2], PR_END_DATE) },
-            body:            unsafe { read_str8(&p[3],    PR_BODY,                 "") },
+            body:            unsafe { read_unicode(&p[3],  PR_BODY_W,               "") },
             sensitivity:     Sensitivity::from(unsafe { read_long(&p[4], PR_SENSITIVITY, 0) }),
-            organizer_name:  unsafe { read_str8(&p[5],    PR_SENDER_NAME,          "") },
+            organizer_name:  unsafe { read_unicode(&p[5],  PR_SENDER_NAME_W,        "") },
             organizer_email: unsafe { read_unicode(&p[6],  PR_SENDER_SMTP_ADDRESS,  "") },
             location:        unsafe { read_unicode(&p[7],  named.location,          "") },
             is_all_day:      unsafe { read_bool(&p[8],    named.all_day,           false) },
@@ -427,7 +432,7 @@ pub unsafe fn read_events(
                 // rows (returns PT_ERROR instead). Fall back to opening the message
                 // directly to read PidLidAppointmentRecur.
                 if is_recurring && blob.is_empty() && p.len() > 15 {
-                    log::debug!("recur blob missing from table row for '{}'; opening message", unsafe { read_str8(&p[0], PR_SUBJECT, "") });
+                    log::debug!("recur blob missing from table row for '{}'; opening message", unsafe { read_unicode(&p[0], PR_SUBJECT_W, "") });
                     unsafe { fetch_recur_blob(store, &p[15], named.appt_recur) }
                 } else {
                     blob

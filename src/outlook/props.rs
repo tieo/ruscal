@@ -33,12 +33,12 @@ pub const PR_IPM_SUBTREE_ENTRYID: u32 = 0x35E00102;
 pub const PR_DISPLAY_NAME: u32        = 0x3001001E;
 pub const PR_DISPLAY_NAME_W: u32      = 0x3001001F;
 pub const PR_CONTAINER_CLASS: u32     = 0x3613001E;
-pub const PR_SUBJECT: u32             = 0x0037001E;
+pub const PR_SUBJECT_W: u32           = 0x0037001F;
 pub const PR_START_DATE: u32          = 0x00600040;
 pub const PR_END_DATE: u32            = 0x00610040;
-pub const PR_BODY: u32                = 0x1000001E;
+pub const PR_BODY_W: u32              = 0x1000001F;
 pub const PR_SENSITIVITY: u32         = 0x00360003;
-pub const PR_SENDER_NAME: u32         = 0x0C1A001E;
+pub const PR_SENDER_NAME_W: u32       = 0x0C1A001F;
 pub const PR_SENDER_SMTP_ADDRESS: u32 = 0x5D01001F;
 
 // ── Named property GUIDs ──────────────────────────────────────────────────────
@@ -174,6 +174,10 @@ pub fn build_tag_array(tags: &[u32]) -> Vec<u32> {
 
 /// Read a `PT_STRING8` (ANSI) property, returning `fallback` if the tag doesn't match.
 ///
+/// Bytes are decoded from the system ANSI code page via `MultiByteToWideChar`
+/// so Western-European characters (ö, ä, ü, ß, …) survive the round-trip
+/// instead of being mangled to U+FFFD by a naïve UTF-8 interpretation.
+///
 /// # Safety
 /// `prop.Value.lpszA` must be a valid null-terminated string when the tag matches.
 pub unsafe fn read_str8(prop: &SPropValue, expected_tag: u32, fallback: &str) -> String {
@@ -181,9 +185,29 @@ pub unsafe fn read_str8(prop: &SPropValue, expected_tag: u32, fallback: &str) ->
         return fallback.to_owned();
     }
     unsafe {
-        std::ffi::CStr::from_ptr(prop.Value.lpszA.0 as *const i8)
-            .to_string_lossy()
-            .into_owned()
+        let ptr = prop.Value.lpszA.0 as *const u8;
+        if ptr.is_null() { return fallback.to_owned(); }
+        let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
+        let bytes = std::slice::from_raw_parts(ptr, len);
+        ansi_bytes_to_string(bytes).unwrap_or_else(|| fallback.to_owned())
+    }
+}
+
+/// Decode a byte slice in the system ANSI code page (e.g. CP1252 on Western
+/// Windows) to a Rust `String`. Returns `None` on failure so callers fall back
+/// cleanly. Uses the Win32 `MultiByteToWideChar` conversion so all system
+/// code pages — CP1252, CP1250, CP932, etc. — decode correctly without us
+/// having to bundle tables per page.
+fn ansi_bytes_to_string(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() { return Some(String::new()); }
+    use windows::Win32::Globalization::{MultiByteToWideChar, CP_ACP, MB_ERR_INVALID_CHARS};
+    unsafe {
+        let wlen = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, bytes, None);
+        if wlen <= 0 { return None; }
+        let mut wbuf = vec![0u16; wlen as usize];
+        let written = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, bytes, Some(&mut wbuf));
+        if written <= 0 { return None; }
+        Some(String::from_utf16_lossy(&wbuf[..written as usize]))
     }
 }
 

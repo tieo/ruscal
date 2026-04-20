@@ -4,39 +4,11 @@
 /// synced as a single VEVENT with an RRULE, so Google Calendar shows them
 /// as a proper recurring series — not as individual one-off instances.
 use chrono::Utc;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 
 use crate::caldav;
 use crate::event::{BusyStatus, CalendarEvent, Sensitivity};
-
-/// Path of the content-hash cache: `{uid}` → hash of the last successfully PUT
-/// iCalendar body. Skipping identical PUTs avoids Google CalDAV's 409 on
-/// re-uploads of recurring masters that coexist with exception resources.
-fn cache_path(dest_calendar_url: &str) -> Option<PathBuf> {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    dest_calendar_url.hash(&mut h);
-    let stem = format!("sync_cache_{:016x}.json", h.finish());
-    dirs::data_local_dir().map(|d| d.join("ruscal").join(stem))
-}
-
-fn load_cache(dest_calendar_url: &str) -> HashMap<String, u64> {
-    let Some(path) = cache_path(dest_calendar_url) else { return HashMap::new() };
-    std::fs::read_to_string(&path).ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_cache(dest_calendar_url: &str, cache: &HashMap<String, u64>) {
-    let Some(path) = cache_path(dest_calendar_url) else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(s) = serde_json::to_string(cache) {
-        let _ = std::fs::write(path, s);
-    }
-}
+use crate::state;
 
 fn hash_ical(s: &str) -> u64 {
     // Strip lines whose value changes on every generation but whose meaning is
@@ -69,6 +41,7 @@ pub struct SyncReport {
 }
 
 pub fn run_sync(
+    pair_id:           &str,
     dest_calendar_url: &str,
     access_token:      &str,
 ) -> Result<SyncReport, String> {
@@ -90,7 +63,8 @@ pub fn run_sync(
     let mut synced  = 0usize;
     let mut skipped_titles = Vec::new();
     let mut synced_uids = std::collections::HashSet::new();
-    let mut cache = load_cache(dest_calendar_url);
+    let mut pair_state = state::load_pair(pair_id);
+    let cache = &mut pair_state.hash_cache;
     for event in &events {
         let uid  = event_uid(event);
         let ical = event_to_ical(event, &uid);
@@ -102,10 +76,14 @@ pub fn run_sync(
             match put_with_retry(dest_calendar_url, &uid, &ical, access_token) {
                 Ok(PutOutcome::Ok)      => { synced_uids.insert(uid.clone()); synced += 1; cache.insert(uid.clone(), h); }
                 Ok(PutOutcome::Skipped) => {
-                    // Cache the hash so we don't re-hit the same 409 every sync.
-                    // If Outlook later edits this event the hash changes, and we'll retry.
+                    // Do NOT cache the hash on a skip. If we did, an externally
+                    // resolved conflict (e.g. the colliding Google event gets
+                    // deleted) would never trigger a retry — the cached hash
+                    // would silently match every subsequent sync. Re-attempting
+                    // the PUT once per cycle is cheap and the only way ruscal
+                    // can recover automatically.
                     synced_uids.insert(uid.clone());
-                    cache.insert(uid.clone(), h);
+                    cache.remove(&uid);
                     skipped_titles.push(event.subject.clone());
                 }
                 Err(e) => return Err(format!("CalDAV PUT: {e}")),
@@ -123,15 +101,16 @@ pub fn run_sync(
             match put_with_retry(dest_calendar_url, &exc_uid, &exc_ical, access_token) {
                 Ok(PutOutcome::Ok)      => { synced_uids.insert(exc_uid.clone()); cache.insert(exc_uid, eh); }
                 Ok(PutOutcome::Skipped) => {
+                    // Same reasoning as the master path above — never cache on skip.
                     synced_uids.insert(exc_uid.clone());
-                    cache.insert(exc_uid, eh);
+                    cache.remove(&exc_uid);
                     skipped_titles.push(format!("{} (exception)", event.subject));
                 }
                 Err(e) => return Err(format!("CalDAV PUT exception {exc_uid}: {e}")),
             }
         }
     }
-    save_cache(dest_calendar_url, &cache);
+    state::save_pair(pair_id, pair_state);
 
     // Delete events that are in Google Calendar but no longer in Outlook.
     delete_orphans(dest_calendar_url, &synced_uids, access_token)
@@ -758,7 +737,14 @@ fn byday_from_mask(mask: u32) -> Vec<&'static str> {
 ///
 /// Google Calendar silently drops events where ORGANIZER is an external address
 /// (not the calendar owner). We surface organizer info as a plain-text prefix in
-/// DESCRIPTION instead, so it remains visible to the user.
+/// DESCRIPTION instead, so it remains visible to the user. The structured
+/// `X-RUSCAL-ORGANIZER-*` properties carry the same info for reverse sync; the
+/// description prefix is cosmetic-only.
+///
+/// **Idempotent:** any existing `Organizer: …` prefix in the incoming body
+/// (e.g. from a prior reverse-sync cycle that copied Google's description back
+/// into Outlook) is stripped before re-prepending, so repeated syncs do not
+/// accumulate stacked prefixes.
 fn build_description(event: &CalendarEvent) -> String {
     let organizer_line = match (event.organizer_name.as_str(), event.organizer_email.as_str()) {
         ("", "")      => String::new(),
@@ -767,12 +753,38 @@ fn build_description(event: &CalendarEvent) -> String {
         (name, email) => format!("Organizer: {name} <{email}>"),
     };
 
-    match (organizer_line.as_str(), event.body.as_str()) {
+    let clean_body = strip_organizer_prefix(&event.body);
+
+    match (organizer_line.as_str(), clean_body.as_str()) {
         ("", "")   => String::new(),
         (org, "")  => org.to_owned(),
         ("", body) => body.to_owned(),
         (org, body) => format!("{org}\n\n{body}"),
     }
+}
+
+/// Strip a leading `Organizer: …\n\n` block from a body string.
+///
+/// Matches the exact shape we emit in [`build_description`] so it only removes
+/// ruscal's own previous injection. A user-written description that genuinely
+/// starts with "Organizer:" is preserved unless it's followed by a blank line,
+/// which would be very unusual for a real note.
+fn strip_organizer_prefix(body: &str) -> String {
+    if !body.starts_with("Organizer:") {
+        return body.to_owned();
+    }
+    // Normalize on \n for splitting, then preserve original CRLF on rejoin
+    // only where it appears (we just emit \n — CalDAV folding adds CRLF).
+    let mut lines = body.split('\n').peekable();
+    // Drop consecutive "Organizer:" lines at the start.
+    while lines.peek().map(|l| l.trim_end_matches('\r').starts_with("Organizer:")).unwrap_or(false) {
+        lines.next();
+    }
+    // Drop the single blank separator line, if present.
+    if lines.peek().map(|l| l.trim_end_matches('\r').is_empty()).unwrap_or(false) {
+        lines.next();
+    }
+    lines.collect::<Vec<_>>().join("\n")
 }
 
 fn escape(s: &str) -> String {
@@ -808,7 +820,630 @@ fn folded(line: String) -> String {
 mod integration {
     use super::*;
     use chrono::Utc;
-    use std::fmt::Write as FmtWrite;
+
+    #[cfg(any())]
+    #[test]
+    #[ignore = "requires live Google credentials"]
+    fn test_xprop_roundtrip() {
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let dest_id = cfg["pairs"][0]["dest_id"].as_str().unwrap().to_owned();
+        let gmail   = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token   = crate::google::get_access_token_for(&gmail).expect("token");
+
+        let uid = "ruscal-xproptest@ruscal";
+        let probe_hex = "DEADBEEFCAFE0123456789ABCDEF";
+        let ical = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ruscal//ruscal//EN\r\n\
+             CALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\nBEGIN:VEVENT\r\n\
+             UID:{uid}\r\nDTSTAMP:20260414T000000Z\r\n\
+             X-RUSCAL-OUTLOOK-GLOBALID:{probe_hex}\r\n\
+             DTSTART:20260601T090000Z\r\nDTEND:20260601T100000Z\r\n\
+             SUMMARY:ruscal xprop roundtrip test\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+
+        crate::caldav::put_event(&dest_id, uid, &ical, &token).expect("PUT failed");
+        let got = crate::caldav::get_event(&dest_id, uid, &token).expect("GET failed");
+        let _ = crate::caldav::delete_event(&dest_id, uid, &token);
+
+        println!("--- server returned ---\n{}", got);
+        assert!(got.contains("X-RUSCAL-OUTLOOK-GLOBALID"),
+            "Google CalDAV stripped the X- property on round-trip — cannot use it for identity mapping");
+        assert!(got.contains(probe_hex),
+            "X- property present but value lost");
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn test_sync_collection_roundtrip() {
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let dest_id = cfg["pairs"][0]["dest_id"].as_str().unwrap().to_owned();
+        let gmail   = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token   = crate::google::get_access_token_for(&gmail).expect("token");
+
+        // Step 1: initial sync — grab current token.
+        let first = crate::caldav::sync_collection(&dest_id, &token, None).expect("initial sync");
+        println!("initial: token={} changes={}", first.new_token, first.changes.len());
+        assert!(!first.new_token.is_empty());
+
+        // Google's sync-token appears to use coarse timestamps — wait a beat so
+        // the PUT happens in a later instant than the token's anchor.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        // Step 2: PUT a fresh event — this must show up in the next delta.
+        let uid = "ruscal-synctest@ruscal";
+        let ical = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ruscal//test//EN\r\n\
+             BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20260415T000000Z\r\n\
+             DTSTART:20260701T090000Z\r\nDTEND:20260701T100000Z\r\n\
+             SUMMARY:ruscal sync-collection test\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        crate::caldav::put_event(&dest_id, uid, &ical, &token).expect("PUT failed");
+
+        // Confirm the PUT actually landed before we blame sync-collection.
+        let got = crate::caldav::get_event(&dest_id, uid, &token).expect("GET after PUT");
+        assert!(got.contains(uid), "PUT didn't land on server");
+
+        // Step 3: delta sync — Google's sync-token has replication lag, so retry.
+        let mut second = crate::caldav::sync_collection(&dest_id, &token, Some(&first.new_token))
+            .expect("delta sync");
+        println!("first token:  {}", first.new_token);
+        println!("second token: {}", second.new_token);
+        println!("token advanced: {}", first.new_token != second.new_token);
+
+        // If server advances its token in chunks, chain tokens forward until
+        // our PUT appears or we exhaust retries.
+        let mut cur_token = second.new_token.clone();
+        let mut all_changes = second.changes;
+        let mut tries = 0;
+        while !all_changes.iter().any(|c| c.href.contains("synctest")) && tries < 10 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let next = crate::caldav::sync_collection(&dest_id, &token, Some(&cur_token))
+                .expect("delta sync retry");
+            println!("retry {tries}: token={} changes={}", next.new_token, next.changes.len());
+            if next.new_token != cur_token {
+                cur_token = next.new_token;
+            }
+            for c in &next.changes {
+                println!("  {} deleted={}", c.href, c.deleted);
+            }
+            all_changes.extend(next.changes);
+            tries += 1;
+        }
+        let second = crate::caldav::SyncResult { new_token: cur_token, changes: all_changes };
+        println!("delta: token={} changes={}", second.new_token, second.changes.len());
+        for c in &second.changes {
+            println!("  {} deleted={} etag={:?}", c.href, c.deleted, c.etag);
+        }
+
+        let _ = crate::caldav::delete_event(&dest_id, uid, &token);
+
+        let found = second.changes.iter().any(|c| c.href.contains("synctest"));
+        assert!(found, "sync-collection did not report our fresh PUT as a change");
+        assert_ne!(first.new_token, second.new_token, "token must advance");
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn test_safe_subset_is_exactly_that() {
+        use crate::ical_parse::ParsedIcal;
+        let owner    = "me@example.com";
+        let wl_uid   = REVERSE_SYNC_UID_WHITELIST[0].to_owned();
+
+        // Build a baseline that passes the whitelist + organizer gate.
+        let whitelisted = |attendees: Vec<String>, organizer: Option<String>| {
+            let mut p = ParsedIcal::default();
+            p.uid                = Some(wl_uid.clone());
+            p.x_organizer_email  = organizer;
+            p.attendees          = attendees;
+            p
+        };
+
+        // Refused: whitelist gate — event not in the initial-rollout list,
+        // even though it would otherwise pass organizer + attendee checks.
+        let mut p = ParsedIcal::default();
+        p.uid               = Some("ruscal-not-listed@ruscal".into());
+        p.x_organizer_email = Some(owner.to_owned());
+        assert!(!check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Refused: UID missing entirely.
+        let mut p = ParsedIcal::default();
+        p.x_organizer_email = Some(owner.to_owned());
+        assert!(!check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Accepted: whitelist + organizer=owner via X-RUSCAL-ORGANIZER-EMAIL, no attendees.
+        let p = whitelisted(vec![], Some(owner.to_owned()));
+        assert!(check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Accepted: fallback ORGANIZER when X-* missing (but still whitelisted).
+        let mut p = ParsedIcal::default();
+        p.uid             = Some(wl_uid.clone());
+        p.organizer_email = Some(owner.to_owned());
+        assert!(check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Accepted: case-insensitive owner match (email addresses are i-case).
+        let p = whitelisted(vec![], Some("Me@Example.COM".to_owned()));
+        assert!(check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Refused: any attendee, even if whitelisted and organizer=owner.
+        let p = whitelisted(vec!["someone@other.com".into()], Some(owner.to_owned()));
+        assert!(!check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Refused: external organizer, even if whitelisted.
+        let p = whitelisted(vec![], Some("external@other.com".to_owned()));
+        assert!(!check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Refused: no organizer known at all.
+        let p = whitelisted(vec![], None);
+        assert!(!check_safe_to_write_to_outlook(&p, owner).safe);
+
+        // Refused: X-* takes precedence over ORGANIZER — if they disagree and
+        // X-* says external, we refuse even though ORGANIZER might match owner.
+        let mut p = ParsedIcal::default();
+        p.uid               = Some(wl_uid.clone());
+        p.x_organizer_email = Some("external@other.com".into());
+        p.organizer_email   = Some(owner.to_owned());
+        assert!(!check_safe_to_write_to_outlook(&p, owner).safe);
+    }
+
+    /// Unit test (no network): building DESCRIPTION twice in a row must be
+    /// idempotent. Simulates the feared reverse-sync cycle where Google's
+    /// description (already containing "Organizer: X\n\n<body>") is copied
+    /// back into Outlook's body and then re-synced — we must not stack
+    /// prefixes.
+    #[test]
+    fn test_organizer_prefix_idempotent() {
+        use crate::event::{BusyStatus, ResponseStatus, Sensitivity};
+        fn sample(body: &str) -> crate::event::CalendarEvent {
+            crate::event::CalendarEvent {
+                subject: "test".into(),
+                start: chrono::Utc::now(),
+                end:   chrono::Utc::now(),
+                is_all_day: false,
+                location: String::new(),
+                organizer_name:  "Alice".into(),
+                organizer_email: "alice@example.com".into(),
+                body: body.into(),
+                busy_status: BusyStatus::Busy,
+                response_status: ResponseStatus::Accepted,
+                sensitivity: Sensitivity::Normal,
+                is_recurring: false,
+                recurrence_end: None,
+                clean_global_id: Vec::new(),
+                recur_blob: Vec::new(),
+            }
+        }
+
+        let original_body = "real meeting notes";
+        let first  = build_description(&sample(original_body));
+        // Simulate reverse sync: the built description becomes the body.
+        let second = build_description(&sample(&first));
+        let third  = build_description(&sample(&second));
+        assert_eq!(first, second, "prefix stacked on round-trip");
+        assert_eq!(second, third, "prefix stacked on triple round-trip");
+        assert!(first.starts_with("Organizer: Alice <alice@example.com>\n\n"));
+        assert!(first.ends_with(original_body));
+
+        // Empty-body case.
+        let only_org = build_description(&sample(""));
+        assert_eq!(only_org, "Organizer: Alice <alice@example.com>");
+        assert_eq!(build_description(&sample(&only_org)), only_org);
+    }
+
+    /// Ad-hoc cleanup: delete OGCS-tagged Google events whose
+    /// `outlook_GlobalApptID` matches an Outlook event currently in the sync
+    /// window (so ruscal would re-create it). Leaves OGCS events whose source
+    /// is no longer in Outlook untouched, and skips Gmail-derived `_e9q*` IDs.
+    ///
+    /// Run with:  cargo test test_delete_ogcs_duplicates -- --ignored --nocapture
+    #[test]
+    #[ignore = "ad-hoc cleanup; requires live Outlook + Google credentials"]
+    fn test_delete_ogcs_duplicates() {
+        // 1. Read Outlook global_ids in the active sync window.
+        let now   = Utc::now();
+        let start = now - chrono::Duration::days(crate::outlook::DEFAULT_PAST_DAYS);
+        let end   = now + chrono::Duration::days(crate::outlook::DEFAULT_FUTURE_DAYS);
+        let events = crate::outlook::read_calendar_events(start, end).expect("Outlook read");
+
+        let outlook_ids: std::collections::HashSet<String> = events.iter()
+            .filter(|e| !e.clean_global_id.is_empty())
+            .map(|e| hex::encode_upper(&e.clean_global_id))
+            .collect();
+        println!("Outlook events in window: {} ({} unique global_ids)",
+            events.len(), outlook_ids.len());
+
+        // 2. List Google events with OGCS extended property.
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let gmail = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token = crate::google::get_access_token_for(&gmail).expect("token");
+
+        let client = reqwest::blocking::Client::new();
+        let mut all_items: Vec<serde_json::Value> = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = String::from(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+                 ?maxResults=2500&showDeleted=false&singleEvents=false");
+            if let Some(t) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(t);
+            }
+            let resp: serde_json::Value = client.get(&url)
+                .bearer_auth(&token).send().expect("list").json().expect("json");
+            if let Some(items) = resp["items"].as_array() {
+                all_items.extend(items.iter().cloned());
+            }
+            page_token = resp["nextPageToken"].as_str().map(str::to_owned);
+            if page_token.is_none() { break; }
+        }
+        println!("Google events listed: {}", all_items.len());
+
+        // 3. Filter to OGCS-tagged ones whose outlook_GlobalApptID matches an
+        //    Outlook event we just read. Skip Gmail-derived (_e9q*) IDs.
+        let candidates: Vec<(String, String, String)> = all_items.iter()
+            .filter_map(|e| {
+                let id = e["id"].as_str()?;
+                if id.starts_with("_e9q") { return None; } // Gmail invite copy
+                let ogcs_id = e["extendedProperties"]["private"]["outlook_GlobalApptID"]
+                    .as_str()?.to_owned();
+                if !outlook_ids.contains(&ogcs_id) { return None; }
+                Some((id.to_owned(), e["summary"].as_str().unwrap_or("(no title)").to_owned(), ogcs_id))
+            })
+            .collect();
+        println!("Duplicates to delete: {}", candidates.len());
+        for (id, summary, _) in &candidates {
+            println!("  {id} | {summary}");
+        }
+
+        // Hard safety floor — refuse to mass-delete if something is clearly off.
+        assert!(candidates.len() <= 200,
+            "refusing to delete > 200 events in one run");
+
+        // 4. DELETE each one via the Google Calendar API.
+        let mut deleted = 0usize;
+        for (id, summary, _) in &candidates {
+            let url = format!(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events/{id}");
+            let resp = client.delete(&url).bearer_auth(&token)
+                .send().expect("delete");
+            let status = resp.status();
+            if status.is_success() || status.as_u16() == 410 {
+                deleted += 1;
+                println!("  DEL ✓ {summary}");
+            } else {
+                let body = resp.text().unwrap_or_default();
+                println!("  DEL ✗ {id} | {status} | {}",
+                    body.chars().take(200).collect::<String>());
+            }
+        }
+        println!("\nDeleted {deleted}/{} OGCS duplicates", candidates.len());
+    }
+
+    /// Diagnose *why* certain subjects keep coming back as "skipped".
+    ///
+    /// For each configured skip-target subject, lists every Google event
+    /// currently matching that summary: iCalUID, Google ID, extendedProperties,
+    /// organizer, status, created-by. Helps distinguish:
+    ///
+    /// - Gmail-derived invite (id starts with `_e9q…`)
+    /// - Leftover OGCS copy (has `outlook_GlobalApptID` extendedProperty)
+    /// - Earlier ruscal copy that ruscal's own UID collides with (ends `@ruscal`)
+    /// - Something else
+    ///
+    /// Run with:
+    ///   cargo test --bin ruscal test_diagnose_skipped_subjects -- --ignored --nocapture
+    #[test]
+    #[ignore = "ad-hoc diagnostic; requires live Google credentials"]
+    fn test_diagnose_skipped_subjects() {
+        let needles: &[&str] = &[
+            "LICCON3 testing",
+            "LICCON3 VS Code als Eclipse Ersatz",
+            "Erkl",  // matches both "Erklärung" and "Erkl�rung"
+        ];
+
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let gmail = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token = crate::google::get_access_token_for(&gmail).expect("token");
+
+        let client = reqwest::blocking::Client::new();
+        let mut all_items: Vec<serde_json::Value> = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = String::from(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+                 ?maxResults=2500&showDeleted=false&singleEvents=false");
+            if let Some(t) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(t);
+            }
+            let resp: serde_json::Value = client.get(&url)
+                .bearer_auth(&token).send().expect("list").json().expect("json");
+            if let Some(items) = resp["items"].as_array() {
+                all_items.extend(items.iter().cloned());
+            }
+            page_token = resp["nextPageToken"].as_str().map(str::to_owned);
+            if page_token.is_none() { break; }
+        }
+        println!("Scanned {} Google events", all_items.len());
+
+        for needle in needles {
+            println!("\n═══ {needle} ═══");
+            let hits: Vec<_> = all_items.iter()
+                .filter(|e| {
+                    e["summary"].as_str().map(|s| s.contains(needle)).unwrap_or(false)
+                })
+                .collect();
+            println!("  {} match(es)", hits.len());
+
+            for e in hits {
+                let id       = e["id"].as_str().unwrap_or("?");
+                let ical_uid = e["iCalUID"].as_str().unwrap_or("?");
+                let summary  = e["summary"].as_str().unwrap_or("?");
+                let status   = e["status"].as_str().unwrap_or("?");
+                let creator  = e["creator"]["email"].as_str().unwrap_or("?");
+                let organizer = e["organizer"]["email"].as_str().unwrap_or("?");
+                let is_recur = e["recurrence"].is_array();
+                let recurring_id = e["recurringEventId"].as_str();
+                let ogcs_id  = e["extendedProperties"]["private"]["outlook_GlobalApptID"]
+                    .as_str().unwrap_or("-");
+                let private_keys: Vec<&str> = e["extendedProperties"]["private"]
+                    .as_object()
+                    .map(|m| m.keys().map(|s| s.as_str()).collect())
+                    .unwrap_or_default();
+
+                let kind = if id.starts_with("_e9q") { "GMAIL-INVITE" }
+                    else if ical_uid.ends_with("@ruscal") { "RUSCAL" }
+                    else if ogcs_id != "-" { "OGCS-LEFTOVER" }
+                    else { "OTHER" };
+
+                println!("  [{kind}]");
+                println!("    summary:      {summary}");
+                println!("    id:           {id}");
+                println!("    iCalUID:      {ical_uid}");
+                println!("    status:       {status}");
+                println!("    creator:      {creator}");
+                println!("    organizer:    {organizer}");
+                println!("    recurring:    {is_recur}  recurring_id={recurring_id:?}");
+                println!("    OGCS_id:      {ogcs_id}");
+                println!("    priv_keys:    {private_keys:?}");
+            }
+        }
+    }
+
+    /// Delete Google events that collide with ruscal's CalDAV URLs.
+    ///
+    /// Targets events where ALL of the following hold:
+    ///   - `iCalUID` ends in `@ruscal` (ruscal-format UID — not a stranger's invite)
+    ///   - `extendedProperties.private.outlook_GlobalApptID` matches an Outlook
+    ///     event currently in the sync window (will be re-created)
+    ///   - Google event `id` starts with `_` (the CalDAV URL Google assigned does
+    ///     NOT match `{uid}.ics`, so ruscal's PUT gets 409 "conflict, different URL")
+    ///
+    /// These are OGCS-created copies that ruscal's PUT cannot upsert into
+    /// because Google stores them at an internal URL (`_e9q…`) instead of
+    /// `{uid}.ics`. Deleting clears the URL conflict; the next ruscal sync
+    /// re-creates them at the correct CalDAV URL.
+    ///
+    /// Run with:
+    ///   cargo test --bin ruscal test_delete_url_conflicts -- --ignored --nocapture
+    #[test]
+    #[ignore = "ad-hoc cleanup; requires live Outlook + Google credentials"]
+    fn test_delete_url_conflicts() {
+        // 1. Read current Outlook window so we only delete events that will
+        //    be re-created (never strand the user without their meetings).
+        let now   = Utc::now();
+        let start = now - chrono::Duration::days(crate::outlook::DEFAULT_PAST_DAYS);
+        let end   = now + chrono::Duration::days(crate::outlook::DEFAULT_FUTURE_DAYS);
+        let events = crate::outlook::read_calendar_events(start, end).expect("Outlook read");
+        let outlook_ids: std::collections::HashSet<String> = events.iter()
+            .filter(|e| !e.clean_global_id.is_empty())
+            .map(|e| hex::encode_upper(&e.clean_global_id))
+            .collect();
+        println!("Outlook global_ids in window: {}", outlook_ids.len());
+
+        // 2. Fetch all Google events.
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let gmail = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token = crate::google::get_access_token_for(&gmail).expect("token");
+
+        let client = reqwest::blocking::Client::new();
+        let mut all_items: Vec<serde_json::Value> = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = String::from(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+                 ?maxResults=2500&showDeleted=false&singleEvents=false");
+            if let Some(t) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(t);
+            }
+            let resp: serde_json::Value = client.get(&url)
+                .bearer_auth(&token).send().expect("list").json().expect("json");
+            if let Some(items) = resp["items"].as_array() {
+                all_items.extend(items.iter().cloned());
+            }
+            page_token = resp["nextPageToken"].as_str().map(str::to_owned);
+            if page_token.is_none() { break; }
+        }
+        println!("Google events scanned: {}", all_items.len());
+
+        // 3. Select URL-conflict candidates.
+        //
+        // Any Google event whose iCalUID ends in `@ruscal` AND whose Google
+        // `id` starts with `_` is a misplaced ruscal event: ruscal only PUTs
+        // at `{uid}.ics`, so a ruscal-UID event at a non-standard URL is by
+        // definition a CalDAV URL conflict. We delete these so the next PUT
+        // can land at the correct URL.
+        //
+        // We do NOT require `outlook_GlobalApptID` — recurrence overrides
+        // (`_exc_YYYYMMDD@ruscal`) don't carry that OGCS tag but are still
+        // clearly ruscal's own events.
+        let candidates: Vec<(String, String)> = all_items.iter()
+            .filter_map(|e| {
+                let id       = e["id"].as_str()?;
+                let ical_uid = e["iCalUID"].as_str()?;
+                let summary  = e["summary"].as_str().unwrap_or("(no title)").to_owned();
+
+                let id_is_internal = id.starts_with('_');
+                let uid_is_ruscal  = ical_uid.ends_with("@ruscal");
+
+                if id_is_internal && uid_is_ruscal {
+                    // Informational: tag whether the original Outlook source
+                    // is still in the window (all 5 current hits match one).
+                    let ogcs_id = e["extendedProperties"]["private"]["outlook_GlobalApptID"]
+                        .as_str().unwrap_or("");
+                    let tag = if outlook_ids.contains(ogcs_id) { "[outlook-match]" }
+                        else if ogcs_id.is_empty() { "[no-ogcs-tag]" }
+                        else { "[outlook-missing]" };
+                    Some((id.to_owned(), format!("{tag} {summary}")))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        println!("URL-conflict candidates: {}", candidates.len());
+        for (id, summary) in &candidates {
+            println!("  {id} | {summary}");
+        }
+
+        // Hard safety floor — refuse mass deletion.
+        assert!(candidates.len() <= 50,
+            "refusing to delete > 50 events in one run (got {})", candidates.len());
+
+        // 4. DELETE each via Google Calendar API.
+        let mut deleted = 0usize;
+        for (id, summary) in &candidates {
+            let url = format!(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events/{id}");
+            let resp = client.delete(&url).bearer_auth(&token).send().expect("delete");
+            let status = resp.status();
+            if status.is_success() || status.as_u16() == 410 {
+                deleted += 1;
+                println!("  DEL ✓ {summary}");
+            } else {
+                let body = resp.text().unwrap_or_default();
+                println!("  DEL ✗ {id} | {status} | {}",
+                    body.chars().take(200).collect::<String>());
+            }
+        }
+        println!("\nDeleted {deleted}/{} URL-conflict events", candidates.len());
+    }
+
+    /// Run the real `run_sync` end-to-end and print the report. Useful for
+    /// debugging skipped events without round-tripping through the UI.
+    ///
+    /// Run with:
+    ///   cargo test --bin ruscal test_run_sync_now -- --ignored --nocapture
+    #[test]
+    #[ignore = "ad-hoc; requires live Outlook + Google credentials"]
+    fn test_run_sync_now() {
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let dest_id = cfg["pairs"][0]["dest_id"].as_str().unwrap().to_owned();
+        let gmail   = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let source  = cfg["pairs"][0]["source_account"].as_str().unwrap().to_owned();
+        let token   = crate::google::get_access_token_for(&gmail).expect("token");
+
+        let pair_id = crate::state::pair_id(&source, &dest_id);
+        println!("pair_id: {pair_id}");
+
+        let report = run_sync(&pair_id, &dest_id, &token).expect("run_sync");
+        println!("\n=== sync report ===");
+        println!("synced:  {}", report.synced);
+        println!("skipped: {} {:?}", report.skipped_titles.len(), report.skipped_titles);
+    }
+
+    /// Lookup-by-global-id round-trip: read the Outlook calendar, pick any
+    /// event, encode its `clean_global_id` as hex, feed it back through
+    /// `find_outlook_event_by_global_id`, and confirm the same event comes back.
+    ///
+    #[cfg(any())]
+    #[test]
+    fn test_lookup_by_global_id() {
+        let start = Utc::now() - chrono::Duration::days(crate::outlook::DEFAULT_PAST_DAYS);
+        let end   = Utc::now() + chrono::Duration::days(crate::outlook::DEFAULT_FUTURE_DAYS);
+        let events = crate::outlook::read_calendar_events(start, end).expect("read");
+
+        let sample = events.iter().find(|e| !e.clean_global_id.is_empty())
+            .expect("no event with a clean_global_id — cannot test lookup");
+        let hex_id = hex::encode_upper(&sample.clean_global_id);
+        println!("seeking Outlook event: {:?} (id {})", sample.subject, hex_id);
+
+        let found = find_outlook_event_by_global_id(&hex_id)
+            .expect("lookup failed")
+            .expect("lookup returned None for a just-read event");
+        assert_eq!(found.clean_global_id, sample.clean_global_id);
+        assert_eq!(found.subject, sample.subject);
+    }
+
+    /// End-to-end test of the dry-run Google change detector: PUT a fresh
+    /// @ruscal event, run `detect_google_changes`, expect it to appear. Then
+    /// DELETE it, run again, expect a `deleted=true` entry for the same UID.
+    ///
+    #[cfg(any())]
+    #[test]
+    fn test_detect_google_changes() {
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let dest_id = cfg["pairs"][0]["dest_id"].as_str().unwrap().to_owned();
+        let gmail   = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token   = crate::google::get_access_token_for(&gmail).expect("token");
+
+        // Use a test-isolated pair_id so we don't disturb real state.
+        let pid = format!("__TEST_DETECT__{}", dest_id);
+
+        // Catch up first so subsequent deltas are small.
+        let _ = detect_google_changes(&pid, &dest_id, &token).expect("initial catchup");
+
+        // Give Google time to checkpoint before our PUT.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        let uid = "ruscal-detecttest@ruscal";
+        let ical = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ruscal//test//EN\r\n\
+             BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20260415T000000Z\r\n\
+             DTSTART:20260801T090000Z\r\nDTEND:20260801T100000Z\r\n\
+             SUMMARY:detect-test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        crate::caldav::put_event(&dest_id, uid, &ical, &token).expect("PUT");
+
+        // Detect — retry because Google's sync-token lags.
+        let mut found_put = false;
+        for i in 0..10 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let changes = detect_google_changes(&pid, &dest_id, &token).expect("detect");
+            println!("try {i}: {} changes", changes.len());
+            if changes.iter().any(|c| c.uid == uid && !c.deleted) { found_put = true; break; }
+        }
+        assert!(found_put, "detector didn't report our PUT");
+
+        // Now DELETE and confirm detector reports it.
+        crate::caldav::delete_event(&dest_id, uid, &token).expect("DELETE");
+        let mut found_del = false;
+        for i in 0..10 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let changes = detect_google_changes(&pid, &dest_id, &token).expect("detect after delete");
+            println!("del try {i}: {} changes", changes.len());
+            if changes.iter().any(|c| c.uid == uid && c.deleted) { found_del = true; break; }
+        }
+        assert!(found_del, "detector didn't report our DELETE");
+
+        // Clean up the test pair state so state.json stays tidy.
+        let mut app = crate::state::load();
+        app.pairs.remove(&pid);
+        crate::state::save(&app);
+    }
 
     /// Second consecutive `run_sync` must return zero skipped titles — everything
     /// is hash-cached from the first run.
@@ -828,10 +1463,12 @@ mod integration {
 
         // First run may legitimately have skips (409s on unseen events). We only
         // care that those are now cached and the *second* run is silent.
-        let first = run_sync(&dest_id, &token).expect("first sync");
+        let source_acc = cfg["pairs"][0]["source_account"].as_str().unwrap_or("").to_owned();
+        let pid = crate::state::pair_id(&source_acc, &dest_id);
+        let first = run_sync(&pid, &dest_id, &token).expect("first sync");
         println!("first:  synced={} skipped={:?}", first.synced, first.skipped_titles);
 
-        let second = run_sync(&dest_id, &token).expect("second sync");
+        let second = run_sync(&pid, &dest_id, &token).expect("second sync");
         println!("second: synced={} skipped={:?}", second.synced, second.skipped_titles);
 
         assert!(second.skipped_titles.is_empty(),
