@@ -177,31 +177,66 @@ pub fn check_for_update(current_version: &str) -> Option<String> {
     let json: serde_json::Value = resp.json().ok()?;
     let latest = json["tag_name"].as_str()?;
 
-    decide_update(current_version, latest)
+    decide_update(current_version, read_installed_version().as_deref(), latest)
 }
 
 /// Decide whether to offer an update — pure, no I/O. Separated from
 /// [`check_for_update`] so the decision logic is unit-testable.
 ///
-/// Returns `Some(version_without_v)` if the user should be offered `latest`,
-/// `None` otherwise.
-fn decide_update(current: &str, latest: &str) -> Option<String> {
-    // Dev builds (commits past the last tag, or a dirty working tree) contain
-    // unpublished work. The "latest release" would be *behind* those local
-    // commits — offering it would overwrite work in progress. Stay silent;
-    // the developer can retag + rerelease when they're ready to ship.
-    if is_dev_build(current) {
-        return None;
-    }
+/// `installed` is the version the installed (production) binary at
+/// `%LOCALAPPDATA%\ruscal\ruscal.exe` last reported on startup — that's the
+/// copy the self-updater will actually replace, not the running exe. When the
+/// developer runs a dev build from `cargo run`, comparing against the dev
+/// version would misleadingly report "up to date" even though the cached
+/// production copy is stale. We compare against the installed version instead.
+///
+/// Returns `Some(version_without_v)` if an update should be offered.
+fn decide_update(current: &str, installed: Option<&str>, latest: &str) -> Option<String> {
+    // Dev builds contain unpublished work — the running exe isn't the one
+    // the self-updater touches. Fall back to the recorded installed version;
+    // if there isn't one (user never launched the installed exe) we have no
+    // meaningful comparison, so stay silent.
+    let effective = if is_dev_build(current) {
+        match installed {
+            Some(v) if !is_dev_build(v) => v,
+            _ => return None,
+        }
+    } else {
+        current
+    };
 
-    let latest_clean  = latest.trim_start_matches('v');
-    let current_clean = current.trim_start_matches('v');
+    let latest_clean    = latest.trim_start_matches('v');
+    let effective_clean = effective.trim_start_matches('v');
 
-    if semver_gt(latest_clean, current_clean) {
+    if semver_gt(latest_clean, effective_clean) {
         Some(latest_clean.to_owned())
     } else {
         None
     }
+}
+
+/// Path of the sidecar file recording the version of the installed exe.
+fn installed_version_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("ruscal").join(".installed_version"))
+}
+
+/// Read the version string last recorded by the installed binary at startup.
+/// Returns `None` if the sidecar doesn't exist or is unreadable.
+pub fn read_installed_version() -> Option<String> {
+    let content = std::fs::read_to_string(installed_version_path()?).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+}
+
+/// Stamp the installed version sidecar. Call on startup when the running exe
+/// IS the installed binary — so later dev runs can still tell whether the
+/// cached production copy is out of date.
+pub fn record_installed_version(version: &str) {
+    let Some(path) = installed_version_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, version);
 }
 
 /// Is this version string a dev build?
@@ -304,27 +339,68 @@ mod tests {
         assert!(!is_dev_build("v1.0.8-rc.1"),        "pre-release tag with dot");
     }
 
-    /// The regression that motivated this helper: a dev build at
-    /// `v1.0.7-3-g...` used to offer "update to v1.0.8", which would
-    /// silently overwrite the local unpublished commits with the release.
+    /// Dev builds with no recorded installed version stay silent: nothing
+    /// actionable to report (the running exe isn't what would get updated,
+    /// and there's no production copy on this machine to compare against).
     #[test]
-    fn decide_update_never_downgrades_dev_builds() {
-        assert_eq!(decide_update("v1.0.7-3-gabc",       "v1.0.8"), None);
-        assert_eq!(decide_update("v1.0.8-1-g1342d9d",   "v1.0.9"), None);
-        assert_eq!(decide_update("v1.0.8-dirty",        "v1.0.9"), None);
-        assert_eq!(decide_update("dev",                 "v1.0.8"), None);
+    fn decide_update_silent_for_dev_build_without_installed_record() {
+        assert_eq!(decide_update("v1.0.7-3-gabc",     None, "v1.0.8"), None);
+        assert_eq!(decide_update("v1.0.8-1-g1342d9d", None, "v1.0.9"), None);
+        assert_eq!(decide_update("v1.0.8-dirty",      None, "v1.0.9"), None);
+        assert_eq!(decide_update("dev",               None, "v1.0.8"), None);
+    }
+
+    /// The regression that motivated this round: developer runs the dev
+    /// build from `cargo run` and the production copy in %LOCALAPPDATA% is
+    /// stale. Check-for-updates must surface the update so they know to
+    /// refresh the cached exe, even though the running dev exe is silent.
+    #[test]
+    fn decide_update_compares_installed_when_running_dev_build() {
+        // Cached production copy is v1.0.8, latest release is v1.0.9 → offer.
+        assert_eq!(
+            decide_update("v1.0.9-1-gabc", Some("v1.0.8"), "v1.0.9"),
+            Some("1.0.9".into()),
+        );
+        // Cached == latest → silent even on dev build.
+        assert_eq!(
+            decide_update("v1.0.9-1-gabc", Some("v1.0.9"), "v1.0.9"),
+            None,
+        );
+    }
+
+    /// Pathological case: the sidecar somehow holds a dev string. Treat
+    /// it as "no useful record" rather than comparing dev-vs-latest.
+    #[test]
+    fn decide_update_ignores_dev_installed_record() {
+        assert_eq!(
+            decide_update("v1.0.9-1-gabc", Some("v1.0.8-dirty"), "v1.0.9"),
+            None,
+        );
     }
 
     #[test]
     fn decide_update_offers_newer_releases_to_clean_builds() {
-        assert_eq!(decide_update("v1.0.7", "v1.0.8"), Some("1.0.8".into()));
-        assert_eq!(decide_update("v1.0.8", "v1.0.9"), Some("1.0.9".into()));
-        assert_eq!(decide_update("v0.9.0", "v1.0.0"), Some("1.0.0".into()));
+        assert_eq!(decide_update("v1.0.7", None, "v1.0.8"), Some("1.0.8".into()));
+        assert_eq!(decide_update("v1.0.8", None, "v1.0.9"), Some("1.0.9".into()));
+        assert_eq!(decide_update("v0.9.0", None, "v1.0.0"), Some("1.0.0".into()));
+    }
+
+    /// On a clean build, the running exe *is* the installed exe (self-install
+    /// copied it), so the installed-version record is redundant — current
+    /// wins. Asserts we don't accidentally let the sidecar override a clean
+    /// current (e.g. sidecar lagging behind after a self-install).
+    #[test]
+    fn decide_update_clean_build_ignores_installed_record() {
+        assert_eq!(
+            decide_update("v1.0.9", Some("v1.0.7"), "v1.0.9"),
+            None,
+            "clean current on latest: installed record must not drag us back",
+        );
     }
 
     #[test]
     fn decide_update_returns_none_when_up_to_date_or_ahead() {
-        assert_eq!(decide_update("v1.0.8", "v1.0.8"), None); // exactly on latest
-        assert_eq!(decide_update("v1.0.9", "v1.0.8"), None); // ahead of latest
+        assert_eq!(decide_update("v1.0.8", None, "v1.0.8"), None); // exactly on latest
+        assert_eq!(decide_update("v1.0.9", None, "v1.0.8"), None); // ahead of latest
     }
 }
