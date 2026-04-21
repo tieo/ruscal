@@ -16,6 +16,11 @@ use auth::GoogleCreds;
 pub enum GoogleError {
     Config(String),
     Auth(String),
+    /// Google rejected the stored refresh token (`invalid_grant`). Happens on
+    /// password change, explicit revoke, 6-month inactivity, or 7-day expiry
+    /// for OAuth clients still in "Testing" verification mode. The caller
+    /// must delete the stored token and run the full OAuth flow again.
+    AuthRevoked(String),
     Api(String),
     Io(std::io::Error),
     Http(reqwest::Error),
@@ -25,12 +30,13 @@ pub enum GoogleError {
 impl std::fmt::Display for GoogleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Config(s) => write!(f, "config: {s}"),
-            Self::Auth(s)   => write!(f, "auth: {s}"),
-            Self::Api(s)    => write!(f, "API: {s}"),
-            Self::Io(e)     => write!(f, "I/O: {e}"),
-            Self::Http(e)   => write!(f, "HTTP: {e}"),
-            Self::Json(e)   => write!(f, "JSON: {e}"),
+            Self::Config(s)      => write!(f, "config: {s}"),
+            Self::Auth(s)        => write!(f, "auth: {s}"),
+            Self::AuthRevoked(s) => write!(f, "auth revoked: {s}"),
+            Self::Api(s)         => write!(f, "API: {s}"),
+            Self::Io(e)          => write!(f, "I/O: {e}"),
+            Self::Http(e)        => write!(f, "HTTP: {e}"),
+            Self::Json(e)        => write!(f, "JSON: {e}"),
         }
     }
 }
@@ -67,8 +73,20 @@ pub fn get_access_token_for(email: &str) -> Result<String, GoogleError> {
     // Try per-account token first.
     if let Some(mut tokens) = auth::load_tokens_for(email) {
         if tokens.is_expired() {
-            tokens = auth::refresh(&creds, &tokens)?;
-            auth::save_tokens_for(email, &tokens)?;
+            match auth::refresh(&creds, &tokens) {
+                Ok(new) => {
+                    tokens = new;
+                    auth::save_tokens_for(email, &tokens)?;
+                }
+                Err(e @ GoogleError::AuthRevoked(_)) => {
+                    // Google has permanently rejected this refresh token.
+                    // Delete it so the next attempt starts clean and the
+                    // user isn't stuck in a retry loop against dead creds.
+                    auth::revoke_tokens_for(email);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
         }
         return Ok(tokens.access_token);
     }
@@ -76,7 +94,14 @@ pub fn get_access_token_for(email: &str) -> Result<String, GoogleError> {
     // Migration: try the old single-account file and adopt it if it matches.
     if let Some(mut tokens) = auth::load_legacy_tokens() {
         if tokens.is_expired() {
-            tokens = auth::refresh(&creds, &tokens)?;
+            match auth::refresh(&creds, &tokens) {
+                Ok(new) => tokens = new,
+                Err(e @ GoogleError::AuthRevoked(_)) => {
+                    auth::delete_legacy_tokens();
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
         }
         let legacy_email = auth::get_user_email(&tokens.access_token).unwrap_or_default();
         if legacy_email == email {
