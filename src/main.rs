@@ -386,6 +386,11 @@ fn main() {
                 return;
             }
         };
+
+        // Record the version of the installed (production) binary so a later
+        // `cargo run` from a dev build can still tell the user whether the
+        // cached copy in %LOCALAPPDATA% is out of date relative to GitHub.
+        updater::record_installed_version(APP_VERSION);
     }
 
     unsafe {
