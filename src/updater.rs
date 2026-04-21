@@ -175,17 +175,64 @@ pub fn check_for_update(current_version: &str) -> Option<String> {
     }
 
     let json: serde_json::Value = resp.json().ok()?;
-    let latest = json["tag_name"].as_str()?.trim_start_matches('v').to_owned();
+    let latest = json["tag_name"].as_str()?;
 
-    // Strip any git-describe suffix (e.g. "1.0.3-2-gabcdef" → "1.0.3")
-    let current_clean = current_version.trim_start_matches('v')
-        .split('-').next().unwrap_or(current_version);
+    decide_update(current_version, latest)
+}
 
-    if semver_gt(&latest, current_clean) {
-        Some(latest)
+/// Decide whether to offer an update — pure, no I/O. Separated from
+/// [`check_for_update`] so the decision logic is unit-testable.
+///
+/// Returns `Some(version_without_v)` if the user should be offered `latest`,
+/// `None` otherwise.
+fn decide_update(current: &str, latest: &str) -> Option<String> {
+    // Dev builds (commits past the last tag, or a dirty working tree) contain
+    // unpublished work. The "latest release" would be *behind* those local
+    // commits — offering it would overwrite work in progress. Stay silent;
+    // the developer can retag + rerelease when they're ready to ship.
+    if is_dev_build(current) {
+        return None;
+    }
+
+    let latest_clean  = latest.trim_start_matches('v');
+    let current_clean = current.trim_start_matches('v');
+
+    if semver_gt(latest_clean, current_clean) {
+        Some(latest_clean.to_owned())
     } else {
         None
     }
+}
+
+/// Is this version string a dev build?
+///
+/// Shapes produced by `git describe --tags --always --dirty` (our build.rs):
+/// ```text
+/// v1.2.3                    — clean tagged release       (NOT dev)
+/// v1.2.3-dirty              — tagged + local edits       (dev)
+/// v1.2.3-5-gabc1234         — 5 commits past v1.2.3      (dev)
+/// v1.2.3-5-gabc1234-dirty   — plus uncommitted edits     (dev)
+/// dev                       — `git_version!` fallback    (dev)
+/// ```
+fn is_dev_build(version: &str) -> bool {
+    if version == "dev" || version.ends_with("-dirty") {
+        return true;
+    }
+    // Detect the `-N-gSHA` chunk that git describe appends once there are
+    // commits past the nearest matching tag: between the tag and the SHA,
+    // the middle hyphen-part is a pure digit count ("5") and the SHA chunk
+    // starts with 'g'.
+    let mut parts = version.split('-');
+    let _tag   = parts.next();
+    let middle = parts.next();
+    let sha    = parts.next();
+    matches!(
+        (middle, sha),
+        (Some(n), Some(s))
+            if !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_digit())
+            && s.starts_with('g')
+    )
 }
 
 /// Download the release asset for `version` to a temp file beside the install
@@ -234,4 +281,50 @@ fn semver_gt(a: &str, b: &str) -> bool {
         (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
     }
     parse(a) > parse(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_dev_build_recognises_every_git_describe_shape() {
+        // Clean release tags — not dev.
+        assert!(!is_dev_build("v1.0.8"));
+        assert!(!is_dev_build("1.0.8"));
+
+        // Dev shapes.
+        assert!(is_dev_build("dev"),                      "fallback");
+        assert!(is_dev_build("v1.0.8-dirty"),             "tag + dirty");
+        assert!(is_dev_build("v1.0.8-1-g1342d9d"),        "commits past tag");
+        assert!(is_dev_build("v1.0.8-5-gabc1234-dirty"),  "commits + dirty");
+
+        // Adversarial shapes that must NOT be misread as dev builds.
+        assert!(!is_dev_build("v1.0.8-beta"),        "pre-release tag, not commits-past");
+        assert!(!is_dev_build("v1.0.8-rc.1"),        "pre-release tag with dot");
+    }
+
+    /// The regression that motivated this helper: a dev build at
+    /// `v1.0.7-3-g...` used to offer "update to v1.0.8", which would
+    /// silently overwrite the local unpublished commits with the release.
+    #[test]
+    fn decide_update_never_downgrades_dev_builds() {
+        assert_eq!(decide_update("v1.0.7-3-gabc",       "v1.0.8"), None);
+        assert_eq!(decide_update("v1.0.8-1-g1342d9d",   "v1.0.9"), None);
+        assert_eq!(decide_update("v1.0.8-dirty",        "v1.0.9"), None);
+        assert_eq!(decide_update("dev",                 "v1.0.8"), None);
+    }
+
+    #[test]
+    fn decide_update_offers_newer_releases_to_clean_builds() {
+        assert_eq!(decide_update("v1.0.7", "v1.0.8"), Some("1.0.8".into()));
+        assert_eq!(decide_update("v1.0.8", "v1.0.9"), Some("1.0.9".into()));
+        assert_eq!(decide_update("v0.9.0", "v1.0.0"), Some("1.0.0".into()));
+    }
+
+    #[test]
+    fn decide_update_returns_none_when_up_to_date_or_ahead() {
+        assert_eq!(decide_update("v1.0.8", "v1.0.8"), None); // exactly on latest
+        assert_eq!(decide_update("v1.0.9", "v1.0.8"), None); // ahead of latest
+    }
 }
