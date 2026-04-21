@@ -9,8 +9,13 @@ mod state;
 mod sync;
 mod updater;
 
+/// Embedded version from `git describe`. Shapes:
+/// * `v1.2.3`               → clean build on a tagged release commit
+/// * `v1.2.3-5-gabc1234`    → 5 commits past the last tag (dev build)
+/// * `v1.2.3-5-gabc1234-dirty` → plus uncommitted changes (local hack)
+/// * `dev`                  → not a git checkout at build time
 const APP_VERSION: &str = git_version::git_version!(
-    args = ["--tags", "--match", "v*", "--always"],
+    args = ["--tags", "--match", "v*", "--always", "--dirty"],
     prefix = "",
     fallback = "dev",
 );
@@ -265,6 +270,24 @@ fn status_text(
     }
 }
 
+/// Does this raw sync error mean the user needs to re-authenticate with Google?
+///
+/// Covers every shape the sync path can produce for "Google no longer accepts
+/// our credentials":
+/// * `auth revoked` — [`GoogleError::AuthRevoked`] (refresh returned `invalid_grant`)
+/// * `invalid_grant` — raw OAuth error, in case it reaches us without going through the variant
+/// * `No stored token` — there is no token file for the configured account yet
+/// * `401` / `403` — Google API rejected the access token we sent
+///
+/// One detector, one UI treatment: the "Re-authenticate" button.
+fn needs_reauth(e: &str) -> bool {
+    e.contains("auth revoked")
+        || e.contains("invalid_grant")
+        || e.contains("No stored token")
+        || e.contains("401")
+        || e.contains("403")
+}
+
 /// Translate raw sync errors into user-friendly messages.
 fn friendly_error(e: &str) -> String {
     if e.contains("MAPI_E_LOGON_FAILED") || e.contains("0x80040111") {
@@ -273,10 +296,64 @@ fn friendly_error(e: &str) -> String {
         "Outlook MAPI not initialized — restart Outlook".into()
     } else if e.contains("MAPI") {
         format!("Outlook error: {e}")
-    } else if e.contains("401") || e.contains("403") {
-        "Google auth expired — re-open the app to re-authenticate".into()
+    } else if needs_reauth(e) {
+        "Google access needs re-authentication — click Re-authenticate below".into()
     } else {
         format!("Sync error: {e}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{friendly_error, needs_reauth};
+
+    /// Every shape of "Google no longer accepts our creds" must be detected.
+    /// One detector, so any auth failure shows the same UI treatment.
+    #[test]
+    fn needs_reauth_covers_every_auth_failure_shape() {
+        let reauth_cases = [
+            "auth revoked: refresh token rejected",
+            r#"auth: refresh failed: {"error":"invalid_grant"}"#,
+            "auth: No stored token for foo@bar.com",
+            "API: HTTP 401 Unauthorized",
+            "API: HTTP 403 Forbidden",
+        ];
+        for raw in reauth_cases {
+            assert!(needs_reauth(raw), "needs_reauth missed: {raw}");
+        }
+
+        let non_reauth_cases = [
+            "Outlook error: MAPI_E_LOGON_FAILED",
+            "some random network blip",
+            "HTTP 500 Internal Server Error",
+        ];
+        for raw in non_reauth_cases {
+            assert!(!needs_reauth(raw), "needs_reauth false-positive: {raw}");
+        }
+    }
+
+    /// All reauth cases must map to a single friendly message that mentions
+    /// the Re-authenticate button, so there is exactly one hardcoded string.
+    #[test]
+    fn friendly_error_gives_one_message_for_all_reauth_cases() {
+        let expected = "Google access needs re-authentication — click Re-authenticate below";
+        let cases = [
+            "auth revoked: refresh token rejected by Google",
+            r#"auth: refresh failed: {"error":"invalid_grant"}"#,
+            "auth: No stored token for foo@bar.com — please re-authenticate",
+            "API: HTTP 401 Unauthorized",
+            "API: HTTP 403 Forbidden",
+        ];
+        for raw in cases {
+            assert_eq!(friendly_error(raw), expected, "mismatch for: {raw}");
+        }
+    }
+
+    #[test]
+    fn friendly_error_passes_through_generic() {
+        let raw = "some unknown failure";
+        let out = friendly_error(raw);
+        assert!(out.starts_with("Sync error"), "got: {out}");
     }
 }
 
@@ -485,8 +562,10 @@ fn main() {
                         }
                         Err(ref e) => {
                             log::error!("Sync failed: {e}");
+                            let raw = e.as_str();
                             p.set_sync_status(SyncStatus::Error);
-                            p.set_sync_error_detail(e.as_str().into());
+                            p.set_sync_error_detail(friendly_error(raw).into());
+                            p.set_auth_needed(needs_reauth(raw));
                             p.set_last_sync_text(
                                 status_text(*last_synced.lock().unwrap(), app_start, true, secs).into()
                             );
@@ -781,6 +860,36 @@ fn main() {
                     snap_to_tray(&p);
                     p.show().ok();
                     if let Ok((_token, _email)) = result {
+                        let accounts = google::list_stored_accounts();
+                        p.set_google_accounts(Rc::new(VecModel::from(
+                            accounts.into_iter().map(slint::SharedString::from).collect::<Vec<_>>()
+                        )).into());
+                    }
+                }).ok();
+            });
+        }
+    });
+
+    // "Re-authenticate" button inside the sync-error popup — only reached when
+    // the sync failed with a revoked/missing Google refresh token. Runs the
+    // same OAuth flow as "Add Google account" and clears the auth-needed flag
+    // on success so the banner doesn't linger.
+    panel.on_re_authenticate({
+        let weak = panel.as_weak();
+        let browser_path = browser_path.clone();
+        move || {
+            let Some(p) = weak.upgrade() else { return };
+            p.hide().ok();
+            let browser = browser_path.lock().unwrap().clone();
+            let weak2 = weak.clone();
+            std::thread::spawn(move || {
+                let result = google::authorize_new_account(browser.as_deref());
+                slint::invoke_from_event_loop(move || {
+                    let Some(p) = weak2.upgrade() else { return };
+                    snap_to_tray(&p);
+                    p.show().ok();
+                    if let Ok((_token, _email)) = result {
+                        p.set_auth_needed(false);
                         let accounts = google::list_stored_accounts();
                         p.set_google_accounts(Rc::new(VecModel::from(
                             accounts.into_iter().map(slint::SharedString::from).collect::<Vec<_>>()

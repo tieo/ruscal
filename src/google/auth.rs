@@ -132,13 +132,45 @@ pub fn refresh(creds: &GoogleCreds, tokens: &Tokens) -> Result<Tokens, GoogleErr
         .send()?
         .json()?;
 
+    parse_refresh_response(&resp, &tokens.refresh_token, &tokens.email)
+}
+
+/// Convert Google's `/token` JSON response into a [`Tokens`] value.
+///
+/// Split out from [`refresh`] so the parsing logic — including the
+/// `invalid_grant` detection — can be unit-tested without hitting the
+/// network.
+fn parse_refresh_response(
+    resp:          &serde_json::Value,
+    refresh_token: &str,
+    email:         &str,
+) -> Result<Tokens, GoogleError> {
+    // Google returns `{ "error": "...", "error_description": "..." }` on
+    // failure. `invalid_grant` specifically means the refresh token has
+    // been revoked or expired — the caller must re-run the full OAuth
+    // flow; a retry of /token would never succeed.
+    if let Some(err) = resp["error"].as_str() {
+        let desc = resp["error_description"].as_str().unwrap_or("");
+        if err == "invalid_grant" {
+            return Err(GoogleError::AuthRevoked(format!(
+                "refresh token rejected by Google: {desc}"
+            )));
+        }
+        return Err(GoogleError::Auth(format!("refresh failed: {err}: {desc}")));
+    }
+
     let access_token = resp["access_token"]
         .as_str()
         .ok_or_else(|| GoogleError::Auth(format!("refresh failed: {resp}")))?
         .to_owned();
 
     let expires_in = resp["expires_in"].as_i64().unwrap_or(3600);
-    Ok(Tokens { access_token, refresh_token: tokens.refresh_token.clone(), expires_at: now_secs() + expires_in, email: tokens.email.clone() })
+    Ok(Tokens {
+        access_token,
+        refresh_token: refresh_token.to_owned(),
+        expires_at:    now_secs() + expires_in,
+        email:         email.to_owned(),
+    })
 }
 
 // ── Full OAuth flow ───────────────────────────────────────────────────────────
@@ -335,4 +367,60 @@ fn exchange_code(
         .to_owned();
     let expires_in = resp["expires_in"].as_i64().unwrap_or(3600);
     Ok(Tokens { access_token, refresh_token, expires_at: now_secs() + expires_in, email: String::new() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_refresh_response_success() {
+        let resp = json!({
+            "access_token": "new-access-abc",
+            "expires_in":   3599,
+            "scope":        "https://www.googleapis.com/auth/calendar",
+            "token_type":   "Bearer",
+        });
+        // `Tokens` intentionally lacks `Debug` (it holds secrets), so we
+        // can't use `.expect(...)` / `.unwrap_err()` here; pattern-match.
+        match parse_refresh_response(&resp, "old-refresh", "foo@bar.com") {
+            Ok(tokens) => {
+                assert_eq!(tokens.access_token,  "new-access-abc");
+                assert_eq!(tokens.refresh_token, "old-refresh"); // preserved
+                assert_eq!(tokens.email,         "foo@bar.com"); // preserved
+            }
+            Err(e) => panic!("success response should parse, got error: {e}"),
+        }
+    }
+
+    /// The regression that motivated this module: `invalid_grant` means the
+    /// refresh token is dead. The parser must surface it as
+    /// [`GoogleError::AuthRevoked`] so the caller can delete the stored
+    /// token and trigger the OAuth flow — not just a generic auth failure.
+    #[test]
+    fn parse_refresh_response_invalid_grant_is_revoked() {
+        let resp = json!({
+            "error":             "invalid_grant",
+            "error_description": "Token has been expired or revoked.",
+        });
+        match parse_refresh_response(&resp, "rt", "foo@bar.com") {
+            Err(GoogleError::AuthRevoked(_)) => {}
+            Ok(_)  => panic!("invalid_grant must not succeed"),
+            Err(e) => panic!("expected AuthRevoked, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_response_other_oauth_error_stays_generic() {
+        let resp = json!({
+            "error":             "invalid_client",
+            "error_description": "The OAuth client was not found.",
+        });
+        match parse_refresh_response(&resp, "rt", "foo@bar.com") {
+            Err(GoogleError::Auth(_)) => {}
+            Ok(_)  => panic!("invalid_client must not succeed"),
+            Err(e) => panic!("expected Auth, got: {e}"),
+        }
+    }
 }

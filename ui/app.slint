@@ -476,7 +476,12 @@ export component TrayPanel inherits Window {
     in property <string> sync-error-detail: "";
     in-out property <bool> show-error-detail: false;
     in-out property <bool> error-copy-done: false;
+    // True when the error is a revoked-token / missing-token case that the
+    // user can fix by re-running the OAuth flow. Drives the "Re-authenticate"
+    // button in the error panel.
+    in property <bool> auth-needed: false;
     callback copy-error();
+    callback re-authenticate();
 
     Rectangle {
         width: 100%;
@@ -1450,6 +1455,31 @@ export component TrayPanel inherits Window {
 
                     HorizontalLayout {
                         spacing: 8px;
+
+                        // "Re-authenticate" — only visible when the sync error
+                        // is a Google auth-revoked / missing-token case. One
+                        // click triggers the OAuth flow; no Settings detour.
+                        if root.auth-needed: Rectangle {
+                            height: 34px;
+                            horizontal-stretch: 1;
+                            border-radius: 8px;
+                            background: reauth-t.has-hover ? Theme.accent : Theme.accent.with-alpha(0.85);
+                            animate background { duration: 80ms; }
+                            Text {
+                                text: "Re-authenticate";
+                                color: #ffffff;
+                                font-size: 12px; font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            reauth-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.show-error-detail = false;
+                                    root.re-authenticate();
+                                }
+                            }
+                        }
 
                         Rectangle {
                             height: 34px;
