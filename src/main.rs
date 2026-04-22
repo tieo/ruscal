@@ -78,6 +78,25 @@ fn get_autostart() -> bool {
     }
 }
 
+/// Pick the path that should be written to the autostart registry entry.
+///
+/// The registry value must always point at the installed release binary
+/// (under `%LOCALAPPDATA%\ruscal\ruscal.exe`). Writing `current_exe()`
+/// verbatim is wrong during development — the debug target is a
+/// console-subsystem binary, which Windows launches at logon by popping
+/// a terminal window. Closing that terminal then kills ruscal (the
+/// console sends `CTRL_CLOSE_EVENT`). Returns `None` when there is no
+/// installed binary to register, in which case the caller must skip the
+/// write rather than leave a broken entry behind.
+fn pick_autostart_path(installed: Option<&std::path::Path>, installed_exists: bool)
+    -> Option<&std::path::Path>
+{
+    match installed {
+        Some(p) if installed_exists => Some(p),
+        _ => None,
+    }
+}
+
 fn set_autostart(enable: bool) {
     use windows::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, RegSetValueExW, RegDeleteValueW,
@@ -93,17 +112,35 @@ fn set_autostart(enable: bool) {
             return;
         }
         if enable {
-            if let Ok(exe) = std::env::current_exe() {
+            let installed = updater::installed_path();
+            let exists    = installed.as_deref().map(|p| p.exists()).unwrap_or(false);
+            if let Some(exe) = pick_autostart_path(installed.as_deref(), exists) {
                 let path_str: Vec<u16> = format!("{}\0", exe.display()).encode_utf16().collect();
                 let bytes =
                     std::slice::from_raw_parts(path_str.as_ptr() as *const u8, path_str.len() * 2);
                 let _ = RegSetValueExW(key, PCWSTR::from_raw(val_name.as_ptr()),
                                        0, REG_SZ, Some(bytes));
+            } else {
+                log::warn!(
+                    "set_autostart: no installed binary on disk — refusing to register \
+                     a startup entry (would otherwise point at a dev target)"
+                );
             }
         } else {
             let _ = RegDeleteValueW(key, PCWSTR::from_raw(val_name.as_ptr()));
         }
         let _ = RegCloseKey(key);
+    }
+}
+
+/// Overwrite the autostart registry value with the installed binary path
+/// whenever the entry exists. Self-heals users whose registry still points
+/// at `target/debug/ruscal.exe` from an earlier version that used
+/// `current_exe()` at first-run. Idempotent: a no-op once the value is
+/// already correct (Windows treats identical writes as a single update).
+fn repair_autostart() {
+    if get_autostart() {
+        set_autostart(true);
     }
 }
 
@@ -355,6 +392,40 @@ mod tests {
         let out = friendly_error(raw);
         assert!(out.starts_with("Sync error"), "got: {out}");
     }
+
+    // ── Autostart path picker ────────────────────────────────────────────────
+    //
+    // Regression guard: before this test, `set_autostart(true)` wrote
+    // `current_exe()` into `HKCU\...\Run`. On a dev machine that resolved to
+    // `target\debug\ruscal.exe`, a console-subsystem binary that pops a
+    // terminal window at logon and closes the app when that terminal is
+    // closed. The pure helper must *never* hand out that path — the registry
+    // entry has to point at the installed release binary or nothing at all.
+
+    use super::pick_autostart_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn autostart_picks_installed_path_when_it_exists() {
+        let installed = PathBuf::from(r"C:\Users\x\AppData\Local\ruscal\ruscal.exe");
+        let picked = pick_autostart_path(Some(installed.as_path()), true);
+        assert_eq!(picked, Some(installed.as_path()));
+    }
+
+    #[test]
+    fn autostart_refuses_when_installed_binary_missing() {
+        // A dev machine that never ran a release has no installed exe.
+        // Writing anything would either register a debug build (terminal at
+        // logon) or a bogus non-existent path — both worse than no entry.
+        let installed = PathBuf::from(r"C:\Users\x\AppData\Local\ruscal\ruscal.exe");
+        assert_eq!(pick_autostart_path(Some(installed.as_path()), false), None);
+    }
+
+    #[test]
+    fn autostart_refuses_when_install_path_undetermined() {
+        assert_eq!(pick_autostart_path(None, false), None);
+        assert_eq!(pick_autostart_path(None, true), None);
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -391,6 +462,11 @@ fn main() {
         // `cargo run` from a dev build can still tell the user whether the
         // cached copy in %LOCALAPPDATA% is out of date relative to GitHub.
         updater::record_installed_version(APP_VERSION);
+
+        // Self-heal a stale autostart entry from earlier versions that wrote
+        // `target/debug/ruscal.exe` on first-run — that's a console-subsystem
+        // binary and pops a terminal at logon.
+        repair_autostart();
     }
 
     unsafe {
