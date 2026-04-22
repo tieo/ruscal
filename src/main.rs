@@ -22,6 +22,24 @@ const APP_VERSION: &str = git_version::git_version!(
 
 slint::include_modules!();
 
+/// Wizard/page indices shared with `ui/app.slint`'s `current-page` property.
+/// Slint's `int` maps to `i32` in the generated bindings, so these constants
+/// match that type exactly and are usable directly with
+/// `set_current_page` / `get_current_page` — no casts at the call sites.
+mod page {
+    pub const PAIRS:        i32 = 0;
+    pub const SOURCE_PICK:  i32 = 1;
+    pub const DEST_PICK:    i32 = 2;
+    pub const GOOGLE_PICK:  i32 = 3;
+    pub const SETTINGS:     i32 = 4;
+
+    /// The settings cog toggles between the settings page and the pairs list.
+    /// Extracted so the rule is unit-testable without a Slint window.
+    pub fn toggle_settings(current: i32) -> i32 {
+        if current == SETTINGS { PAIRS } else { SETTINGS }
+    }
+}
+
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use slint::{Model, VecModel};
@@ -426,6 +444,25 @@ mod tests {
         assert_eq!(pick_autostart_path(None, false), None);
         assert_eq!(pick_autostart_path(None, true), None);
     }
+
+    // ── Settings cog toggle ────────────────────────────────────────────────
+    //
+    // The cog in the header is a single button and the user expects it to
+    // both open *and* close the settings page. Clicking it twice used to
+    // leave you stranded on the settings screen with no obvious way back.
+    use super::page;
+
+    #[test]
+    fn settings_toggle_from_settings_returns_to_pairs() {
+        assert_eq!(page::toggle_settings(page::SETTINGS), page::PAIRS);
+    }
+
+    #[test]
+    fn settings_toggle_from_any_other_page_opens_settings() {
+        for from in [page::PAIRS, page::SOURCE_PICK, page::DEST_PICK, page::GOOGLE_PICK] {
+            assert_eq!(page::toggle_settings(from), page::SETTINGS, "from page {from}");
+        }
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -455,7 +492,13 @@ fn main() {
     let _instance_guard = match updater::acquire_single_instance() {
         Some(g) => g,
         None => {
-            updater::focus_existing_window();
+            // Don't touch the other process's window directly — we go behind
+            // Slint's back if we call ShowWindow/SetForegroundWindow on a
+            // foreign HWND, and the primary's `p.hide()` would then silently
+            // no-op because its visibility state stayed stale. Instead, nudge
+            // the primary via a named event and let it surface *itself*
+            // through Slint's own API.
+            updater::signal_focus_request();
             return;
         }
     };
@@ -774,7 +817,9 @@ fn main() {
         let weak = panel.as_weak();
         move || {
             if let Some(p) = weak.upgrade() {
-                p.set_current_page(4);
+                // Toggle: if already on the Settings page, return to the pairs
+                // list so the cog button acts like a show/hide switch.
+                p.set_current_page(page::toggle_settings(p.get_current_page()));
             }
         }
     });
@@ -785,14 +830,14 @@ fn main() {
             let Some(p) = weak.upgrade() else { return };
             p.set_outlook_calendars(Rc::new(VecModel::from(vec![])).into());
             p.set_config_pair_index(i);
-            p.set_current_page(1);
+            p.set_current_page(page::SOURCE_PICK);
 
             let weak2 = weak.clone();
             std::thread::spawn(move || {
                 let result = outlook::list_calendar_sources();
                 slint::invoke_from_event_loop(move || {
                     let Some(p) = weak2.upgrade() else { return };
-                    if p.get_current_page() != 1 { return; }
+                    if p.get_current_page() != page::SOURCE_PICK { return; }
                     match result {
                         Ok(calendars) => {
                             let names: Rc<VecModel<slint::SharedString>> = Rc::new(
@@ -806,7 +851,7 @@ fn main() {
                         }
                         Err(e) => {
                             log::error!("Failed to list Outlook calendars: {e:?}");
-                            p.set_current_page(0);
+                            p.set_current_page(page::PAIRS);
                             p.set_last_sync_text(
                                 friendly_error(&format!("Outlook: {e}")).into()
                             );
@@ -832,7 +877,7 @@ fn main() {
                 pairs.set_row_data(pair_index, pair);
                 save_config(&pairs, None);
             }
-            p.set_current_page(0);
+            p.set_current_page(page::PAIRS);
         }
     });
 
@@ -841,7 +886,7 @@ fn main() {
         move |i| {
             let Some(p) = weak.upgrade() else { return };
             p.set_config_pair_index(i);
-            p.set_current_page(2);
+            p.set_current_page(page::DEST_PICK);
         }
     });
 
@@ -862,7 +907,7 @@ fn main() {
                 "Loading calendars…"
             };
             p.set_google_status(status.into());
-            p.set_current_page(3);
+            p.set_current_page(page::GOOGLE_PICK);
 
             // Hide the window while the browser OAuth flow is open.
             if email_hint.is_none() {
@@ -877,7 +922,7 @@ fn main() {
                     // Bring the window back regardless of outcome.
                     snap_to_tray(&p);
                     p.show().ok();
-                    if p.get_current_page() != 3 { return; }
+                    if p.get_current_page() != page::GOOGLE_PICK { return; }
                     match result {
                         Ok((calendars, email)) => {
                             let names: Rc<VecModel<slint::SharedString>> = Rc::new(VecModel::from(
@@ -912,7 +957,7 @@ fn main() {
         let start = start_google_picker.clone();
         move |_provider_index| {
             let Some(p) = weak.upgrade() else { return };
-            if p.get_current_page() == 3 { return; }
+            if p.get_current_page() == page::GOOGLE_PICK { return; }
             // Use the existing account for this pair if it has one.
             let pair_index = p.get_config_pair_index() as usize;
             let email_hint = pairs.row_data(pair_index)
@@ -1032,7 +1077,7 @@ fn main() {
             }
 
             save_config(&pairs, None);
-            p.set_current_page(0);
+            p.set_current_page(page::PAIRS);
             p.invoke_sync_now();
         }
     });
@@ -1179,6 +1224,22 @@ fn main() {
     // first run (setup wizard), fresh install, or just-updated — so the user
     // gets visible confirmation regardless of the setting.
     panel.show().ok();
+
+    // Listen for focus-requests from subsequent `ruscal.exe` launches. The
+    // listener keeps the HANDLE alive for the process lifetime; dropping
+    // `_focus_listener` would close the event and stop servicing wake-ups.
+    let _focus_listener = {
+        let weak = panel.as_weak();
+        updater::listen_for_focus_requests(move || {
+            let weak = weak.clone();
+            slint::invoke_from_event_loop(move || {
+                if let Some(p) = weak.upgrade() {
+                    p.show().ok();
+                    updater::bring_own_window_forward();
+                }
+            }).ok();
+        })
+    };
 
     let force_show =
         first_run
