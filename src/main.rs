@@ -436,28 +436,32 @@ fn main() {
     let launch_args = updater::parse_args();
     updater::cleanup_stale_update_exe();
 
-    // In debug builds, skip self-install and single-instance so `cargo run`
-    // works as a plain dev loop without touching the installed production binary.
+    // Self-install runs release-only: a `cargo run` dev loop must not stomp
+    // the installed production binary at %LOCALAPPDATA%\ruscal.
+    #[cfg(not(debug_assertions))]
+    if !updater::is_installed_path() {
+        let flag = launch_args.just_updated.as_deref()
+            .map(|v| format!("--just-updated={v}"))
+            .unwrap_or_else(|| "--just-installed".to_owned());
+        updater::self_install(Some(&flag)); // diverges — exits this process
+    }
+
+    // Single-instance: if ruscal is already running, bring the existing
+    // window to the front and quit this process. Standard Windows app
+    // behavior — a second click on the shortcut must not respawn the app
+    // (that would close the running window, drop the tray icon, and show
+    // a fresh startup flash). Applies to dev + release: `cargo run` also
+    // defers to an autostarted release instead of starting side-by-side.
+    let _instance_guard = match updater::acquire_single_instance() {
+        Some(g) => g,
+        None => {
+            updater::focus_existing_window();
+            return;
+        }
+    };
+
     #[cfg(not(debug_assertions))]
     {
-        // Self-install: if not running from %LOCALAPPDATA%\ruscal\ruscal.exe,
-        // copy there, terminate any old instance, relaunch, exit.
-        if !updater::is_installed_path() {
-            let flag = launch_args.just_updated.as_deref()
-                .map(|v| format!("--just-updated={v}"))
-                .unwrap_or_else(|| "--just-installed".to_owned());
-            updater::self_install(Some(&flag)); // diverges — exits this process
-        }
-
-        // Single-instance guard: if ruscal is already running, bring it to front.
-        let _instance_guard = match updater::acquire_single_instance() {
-            Some(g) => g,
-            None => {
-                updater::focus_existing_window();
-                return;
-            }
-        };
-
         // Record the version of the installed (production) binary so a later
         // `cargo run` from a dev build can still tell the user whether the
         // cached copy in %LOCALAPPDATA% is out of date relative to GitHub.
@@ -467,6 +471,11 @@ fn main() {
         // `target/debug/ruscal.exe` on first-run — that's a console-subsystem
         // binary and pops a terminal at logon.
         repair_autostart();
+
+        // Existing installs from before the Start-menu integration shipped
+        // don't have a `.lnk` in Programs; create one so ruscal appears in
+        // Windows Search without waiting for another self-install cycle.
+        updater::ensure_start_menu_shortcut();
     }
 
     unsafe {
@@ -1078,14 +1087,15 @@ fn main() {
         let browser_path = browser_path.clone();
         move || {
             // Open a file picker via PowerShell to select an exe.
-            let result = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command",
-                    "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; \
-                     $d = New-Object System.Windows.Forms.OpenFileDialog; \
-                     $d.Filter = 'Executables (*.exe)|*.exe'; \
-                     $d.Title = 'Select browser'; \
-                     if ($d.ShowDialog() -eq 'OK') { $d.FileName }"])
-                .output();
+            let mut cmd = std::process::Command::new("powershell");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command",
+                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; \
+                 $d = New-Object System.Windows.Forms.OpenFileDialog; \
+                 $d.Filter = 'Executables (*.exe)|*.exe'; \
+                 $d.Title = 'Select browser'; \
+                 if ($d.ShowDialog() -eq 'OK') { $d.FileName }"]);
+            updater::hide_console_window(&mut cmd);
+            let result = cmd.output();
             if let Ok(out) = result {
                 let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !path.is_empty() {
@@ -1144,10 +1154,11 @@ fn main() {
             let text = p.get_sync_error_detail().to_string();
             if text.is_empty() { return; }
             let escaped = text.replace('\'', "''");
-            let _ = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command",
-                       &format!("Set-Clipboard -Value '{escaped}'")])
-                .output();
+            let mut cmd = std::process::Command::new("powershell");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command",
+                      &format!("Set-Clipboard -Value '{escaped}'")]);
+            updater::hide_console_window(&mut cmd);
+            let _ = cmd.output();
             p.set_error_copy_done(true);
             let weak2 = weak.clone();
             slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {

@@ -40,3 +40,6 @@ muda = "0.15"
 
 [build-dependencies]
 slint-build = "1"
+ico         = "0.3"
+image       = { version = "0.25", default-features = false, features = ["png"] }
+winresource = "0.1"

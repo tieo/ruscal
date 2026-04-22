@@ -60,6 +60,10 @@ pub fn self_install(flag: Option<&str>) -> ! {
     let current = std::env::current_exe().expect("current_exe");
     std::fs::copy(&current, &installed).expect("failed to copy to install path");
 
+    // Make ruscal searchable in the Start menu. Idempotent — does nothing
+    // when a shortcut is already present from a previous install.
+    ensure_start_menu_shortcut();
+
     // Clean up the update temp file if this process IS the update temp file.
     // We've already copied ourselves to the installed path, so we can delete ourselves.
     if current.file_name().map(|n| n == "ruscal_update.exe").unwrap_or(false) {
@@ -81,22 +85,99 @@ pub fn self_install(flag: Option<&str>) -> ! {
     std::process::exit(0);
 }
 
+// ── Start-menu shortcut ───────────────────────────────────────────────────────
+
+/// Path of the per-user Start-menu `.lnk` for ruscal.
+///
+/// Windows Search indexes the `Programs` folder; without a `.lnk` in there,
+/// ruscal doesn't appear in Start-menu search regardless of how it was
+/// installed. Using `%APPDATA%\...\Start Menu\Programs` means the shortcut
+/// lives with the current user and doesn't require elevation.
+pub fn start_menu_shortcut_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|appdata| {
+        appdata
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("ruscal.lnk")
+    })
+}
+
+/// Create the Start-menu shortcut if it doesn't exist yet, pointing at the
+/// installed exe. Idempotent — a no-op when the shortcut is already present.
+/// Called from `self_install` (so a fresh install is immediately searchable)
+/// and from release-build startup (so existing installs self-heal the first
+/// time they run a version that ships with this function).
+pub fn ensure_start_menu_shortcut() {
+    let Some(lnk) = start_menu_shortcut_path() else { return; };
+    if lnk.exists() { return; }
+    let Some(target) = installed_path() else { return; };
+    if !target.exists() { return; }
+    write_start_menu_shortcut(&lnk, &target);
+}
+
+/// Spawn PowerShell to materialise the `.lnk`. We use the shell's scripting
+/// host because the only alternative is the `IShellLinkW` COM dance (several
+/// hundred lines of `windows` crate boilerplate for a one-shot write). Paths
+/// are quoted as PowerShell single-quoted strings (`'` doubled for escape).
+fn write_start_menu_shortcut(lnk: &std::path::Path, target: &std::path::Path) {
+    if let Some(parent) = lnk.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let q = |p: &std::path::Path| p.to_string_lossy().replace('\'', "''");
+    let lnk_q    = q(lnk);
+    let target_q = q(target);
+    let working  = target.parent().unwrap_or(target);
+    let working_q = q(working);
+
+    let script = format!(
+        "$s = New-Object -ComObject WScript.Shell; \
+         $l = $s.CreateShortcut('{lnk_q}'); \
+         $l.TargetPath = '{target_q}'; \
+         $l.WorkingDirectory = '{working_q}'; \
+         $l.IconLocation = '{target_q},0'; \
+         $l.Description = 'ruscal — Outlook to Google Calendar sync'; \
+         $l.Save()"
+    );
+
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    hide_console_window(&mut cmd);
+    let _ = cmd.output();
+}
+
 /// Kill the process (if any) whose image path equals `path`.
 fn terminate_at_path(path: &std::path::Path) {
     // Escape single-quotes for PowerShell single-quoted string.
     let path_str = path.to_string_lossy().replace('\'', "''");
-    let _ = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "Get-Process | Where-Object {{ $_.Path -eq '{path_str}' }} | Stop-Process -Force"
-            ),
-        ])
-        .output();
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!(
+            "Get-Process | Where-Object {{ $_.Path -eq '{path_str}' }} | Stop-Process -Force"
+        ),
+    ]);
+    hide_console_window(&mut cmd);
+    let _ = cmd.output();
     // Wait for the process to fully release file locks before we copy over it.
     std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+/// Mark a `Command` so Windows does not allocate a console window for it.
+///
+/// ruscal is compiled with `windows_subsystem = "windows"` — it has no
+/// attached console. When such a GUI process spawns a console-subsystem
+/// child (powershell is one), Windows allocates a *new* console for the
+/// child. That window pops visibly on the user's screen and lingers for
+/// the child's lifetime. `CREATE_NO_WINDOW` suppresses it. Dialog windows
+/// raised *from* the child (e.g. `OpenFileDialog`) still appear normally.
+#[cfg(target_os = "windows")]
+pub fn hide_console_window(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 }
 
 // ── Single-instance guard ─────────────────────────────────────────────────────
@@ -140,7 +221,10 @@ pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
     }
 }
 
-/// Bring the existing running instance's window to the foreground.
+/// Bring the running ruscal's window to the foreground. Called when a second
+/// launch loses the single-instance race, so that clicking the shortcut a
+/// second time surfaces the existing instance rather than doing nothing
+/// visible (or, worse, silently quitting).
 pub fn focus_existing_window() {
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOW,
