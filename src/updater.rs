@@ -221,13 +221,109 @@ pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
     }
 }
 
-/// Bring the running ruscal's window to the foreground. Called when a second
-/// launch loses the single-instance race, so that clicking the shortcut a
-/// second time surfaces the existing instance rather than doing nothing
-/// visible (or, worse, silently quitting).
-pub fn focus_existing_window() {
+// ── Cross-process focus signalling ───────────────────────────────────────────
+//
+// A second launch must bring the first instance's window to the front.
+// The earlier approach — `FindWindowW` + `ShowWindow(SW_SHOW)` from the second
+// process — worked visually but broke Slint's internal "window visible" state:
+// Slint did not know the window had been un-hidden behind its back, so a later
+// `p.hide()` (our minimize-to-tray handler) silently no-op'd and left the
+// taskbar entry stuck on screen.
+//
+// Instead, we use a named Win32 event as a wake-up channel. The primary
+// instance creates it, blocks a worker thread on `WaitForSingleObject`, and
+// handles each wake by calling `p.show()` through `invoke_from_event_loop` so
+// Slint's bookkeeping stays coherent. The secondary instance opens the event,
+// calls `SetEvent`, and exits — it never touches the other process's window.
+
+const FOCUS_EVENT_NAME: &str = "Local\\ruscal_focus_request\0";
+
+fn focus_event_name_wide() -> Vec<u16> {
+    FOCUS_EVENT_NAME.encode_utf16().collect()
+}
+
+/// Create the focus-request event and spawn a thread that waits on it,
+/// invoking `on_request` each time a second instance signals.
+///
+/// `on_request` runs on a background thread and should marshal any Slint
+/// work onto the event loop via `slint::invoke_from_event_loop`. The returned
+/// handle must be kept alive for the process lifetime; dropping it closes
+/// the event and the waiting thread exits on the next signal.
+pub fn listen_for_focus_requests<F>(on_request: F) -> Option<FocusListener>
+where
+    F: Fn() + Send + 'static,
+{
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::CreateEventW;
+    use windows::core::PCWSTR;
+
+    let name = focus_event_name_wide();
+    let handle: HANDLE = unsafe {
+        // Manual-reset=false → auto-reset after each wait returns. No security
+        // attrs: the event lives in the Local\ namespace so only the current
+        // logon session can open it.
+        CreateEventW(None, false, false, PCWSTR::from_raw(name.as_ptr())).ok()?
+    };
+
+    // Cross the thread boundary as an integer. `HANDLE` wraps `*mut c_void`
+    // and Rust's disjoint-capture in closures would otherwise try to move the
+    // raw pointer itself (not Send) even if the wrapping struct was marked
+    // Send. `isize` is trivially Send and round-trips through `HANDLE(...)`.
+    let handle_raw: isize = handle.0 as isize;
+    std::thread::spawn(move || {
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        let waited = HANDLE(handle_raw as *mut _);
+        loop {
+            let status = unsafe { WaitForSingleObject(waited, u32::MAX) };
+            if status != WAIT_OBJECT_0 { break; }
+            on_request();
+        }
+    });
+
+    Some(FocusListener(handle))
+}
+
+/// Opaque token representing the primary instance's focus-request listener.
+/// Held for the process lifetime; closed on drop.
+pub struct FocusListener(windows::Win32::Foundation::HANDLE);
+
+// SAFETY: HANDLE wraps a pointer but its only use after Drop is CloseHandle,
+// which is thread-safe. The listener holds a copy for WaitForSingleObject.
+unsafe impl Send for FocusListener {}
+
+impl Drop for FocusListener {
+    fn drop(&mut self) {
+        unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.0); }
+    }
+}
+
+/// Signal the primary instance to bring its window to the foreground.
+/// Called only by a second instance that has already lost the single-instance
+/// race — this function never touches windows directly, so Slint's state in
+/// the primary instance stays consistent.
+pub fn signal_focus_request() {
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    use windows::core::PCWSTR;
+
+    let name = focus_event_name_wide();
+    unsafe {
+        let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(name.as_ptr()))
+        else { return };
+        let _ = SetEvent(handle);
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+}
+
+/// Raise the ruscal window to the foreground. Must be called from the
+/// primary instance's *own* event loop, after `p.show()` — so Slint knows
+/// the window is visible and our Win32 calls don't desync its bookkeeping.
+/// Uses `FindWindowW` in-process: the title is under our control and the
+/// extra Win32 lookup is cheaper than threading the HWND through Slint's
+/// raw-window-handle feature gate.
+pub fn bring_own_window_forward() {
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOW,
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, IsIconic,
     };
     use windows::core::PCWSTR;
 
@@ -237,7 +333,9 @@ pub fn focus_existing_window() {
             return;
         };
         if hwnd.is_invalid() { return; }
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
         let _ = SetForegroundWindow(hwnd);
     }
 }
@@ -486,5 +584,58 @@ mod tests {
     fn decide_update_returns_none_when_up_to_date_or_ahead() {
         assert_eq!(decide_update("v1.0.8", None, "v1.0.8"), None); // exactly on latest
         assert_eq!(decide_update("v1.0.9", None, "v1.0.8"), None); // ahead of latest
+    }
+
+    // ── Cross-instance focus signalling ────────────────────────────────────
+    //
+    // Regression guard: earlier versions reached across process boundaries
+    // with raw `ShowWindow` calls, which desynced Slint's internal visibility
+    // state and left a stuck taskbar entry after minimize-to-tray. The fix
+    // is a named event: secondary signals, primary listens and surfaces the
+    // window through its own event loop. Verify the end-to-end delivery.
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn signal_reaches_listener() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let fired = Arc::new(AtomicU32::new(0));
+        let fired_cb = Arc::clone(&fired);
+        let _listener = super::listen_for_focus_requests(move || {
+            fired_cb.fetch_add(1, Ordering::SeqCst);
+        }).expect("create focus-request event");
+
+        // Signal once and wait for the wake-up. Then signal again and wait
+        // for the next. We can't rely on two back-to-back SetEvents
+        // producing two wake-ups — the auto-reset event *debounces* them
+        // (SetEvent on an already-signaled event is a no-op), which is
+        // desirable in production (bursts collapse to a single window-focus
+        // action). What matters is that each wait-acknowledged signal is
+        // then followed by servicing of the next.
+
+        super::signal_focus_request();
+        wait_for_count(&fired, 1);
+        super::signal_focus_request();
+        wait_for_count(&fired, 2);
+
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn wait_for_count(counter: &std::sync::Arc<std::sync::atomic::AtomicU32>, target: u32) {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(500);
+        while counter.load(Ordering::SeqCst) < target
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            counter.load(Ordering::SeqCst) >= target,
+            "wake-up never arrived (expected >= {target}, got {})",
+            counter.load(Ordering::SeqCst)
+        );
     }
 }
