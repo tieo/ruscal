@@ -46,6 +46,15 @@ fn token_path_for(email: &str) -> Option<PathBuf> {
     tokens_dir().map(|d| d.join(format!("{safe}.json")))
 }
 
+/// Path of the tombstone file written next to a deleted token. The
+/// tombstone preserves the *reason* the token was deleted (typically a
+/// Google `invalid_grant`), so the next sync can show "Refresh token
+/// rejected by Google" rather than the misleading "No stored token".
+fn tombstone_path_for(email: &str) -> Option<PathBuf> {
+    let safe = email.replace('@', "_at_").replace('.', "_dot_");
+    tokens_dir().map(|d| d.join(format!("{safe}.revoked")))
+}
+
 /// Legacy single-account path — kept for migration only.
 pub fn legacy_token_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("ruscal").join("google_token.json"))
@@ -66,13 +75,33 @@ pub fn save_tokens_for(email: &str, tokens: &Tokens) -> Result<(), GoogleError> 
     let mut t = tokens.clone();
     t.email = email.to_owned();
     std::fs::write(path, serde_json::to_string_pretty(&t)?)?;
+    // A successful save means re-auth has resolved whatever the prior
+    // tombstone described. Clear it so future "no token on disk" lookups
+    // don't keep surfacing a stale revocation reason.
+    if let Some(t) = tombstone_path_for(email) {
+        let _ = std::fs::remove_file(t);
+    }
     Ok(())
 }
 
-pub fn revoke_tokens_for(email: &str) {
+pub fn revoke_tokens_for(email: &str, cause: &str) {
     if let Some(path) = token_path_for(email) {
         let _ = std::fs::remove_file(path);
     }
+    if let Some(t) = tombstone_path_for(email) {
+        if let Some(parent) = t.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(t, cause);
+    }
+}
+
+/// Read the recorded revocation cause for `email`, if any. Returns `None`
+/// when no tombstone exists (i.e. token absence isn't from a known
+/// revocation — likely a never-authenticated account).
+pub fn read_revocation(email: &str) -> Option<String> {
+    let path = tombstone_path_for(email)?;
+    std::fs::read_to_string(path).ok()
 }
 
 pub fn load_legacy_tokens() -> Option<Tokens> {
@@ -422,5 +451,72 @@ mod tests {
             Ok(_)  => panic!("invalid_client must not succeed"),
             Err(e) => panic!("expected Auth, got: {e}"),
         }
+    }
+
+    /// Generate an email that's guaranteed not to overlap with a real user
+    /// account on disk, so the test can write under the live `LOCALAPPDATA`
+    /// without polluting real state. The `.invalid` TLD is reserved by RFC
+    /// 2606 for exactly this purpose; PID + nanos make collisions between
+    /// parallel test runs vanishingly unlikely.
+    fn unique_test_email(tag: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("tombstone_{tag}_{}_{}@example.invalid", std::process::id(), nanos)
+    }
+
+    fn cleanup_for(email: &str) {
+        if let Some(p) = token_path_for(email)     { let _ = std::fs::remove_file(p); }
+        if let Some(p) = tombstone_path_for(email) { let _ = std::fs::remove_file(p); }
+    }
+
+    /// Regression: when refresh fails with `invalid_grant` we delete the
+    /// token file so the user isn't stuck retrying dead creds, but the
+    /// next sync used to surface "No stored token" — implying the user
+    /// never authenticated. The tombstone preserves the real cause so the
+    /// follow-up sync can show the original revocation reason instead.
+    #[test]
+    fn revoke_records_tombstone_for_followup_reads() {
+        let email = unique_test_email("revoke");
+        revoke_tokens_for(&email, "Refresh token rejected by Google: invalid_grant");
+        let cause = read_revocation(&email)
+            .expect("revoke should leave a tombstone on disk");
+        assert_eq!(cause, "Refresh token rejected by Google: invalid_grant");
+        cleanup_for(&email);
+    }
+
+    /// A successful re-auth (which writes fresh tokens) must clear any
+    /// stale tombstone — otherwise the user re-authenticates, gets a new
+    /// token, and *still* sees the old revocation message on the next sync.
+    #[test]
+    fn save_tokens_clears_prior_tombstone() {
+        let email = unique_test_email("save");
+        revoke_tokens_for(&email, "earlier failure");
+        assert!(read_revocation(&email).is_some(), "tombstone present pre-save");
+
+        let tokens = Tokens {
+            access_token:  "a".into(),
+            refresh_token: "r".into(),
+            expires_at:    0,
+            email:         email.clone(),
+        };
+        save_tokens_for(&email, &tokens).expect("save_tokens_for");
+
+        assert!(
+            read_revocation(&email).is_none(),
+            "successful save must clear the tombstone",
+        );
+        cleanup_for(&email);
+    }
+
+    /// No tombstone for an email that's never been authenticated — the
+    /// "No stored token" branch in `get_access_token_for` relies on this
+    /// to distinguish "first time use" from "previously revoked".
+    #[test]
+    fn read_revocation_returns_none_for_pristine_email() {
+        let email = unique_test_email("pristine");
+        assert!(read_revocation(&email).is_none());
+        cleanup_for(&email);
     }
 }
