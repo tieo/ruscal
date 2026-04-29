@@ -78,12 +78,15 @@ pub fn get_access_token_for(email: &str) -> Result<String, GoogleError> {
                     tokens = new;
                     auth::save_tokens_for(email, &tokens)?;
                 }
-                Err(e @ GoogleError::AuthRevoked(_)) => {
+                Err(GoogleError::AuthRevoked(cause)) => {
                     // Google has permanently rejected this refresh token.
                     // Delete it so the next attempt starts clean and the
-                    // user isn't stuck in a retry loop against dead creds.
-                    auth::revoke_tokens_for(email);
-                    return Err(e);
+                    // user isn't stuck in a retry loop against dead creds,
+                    // but tombstone the cause so the *next* sync can still
+                    // surface "refresh token rejected" instead of pretending
+                    // nothing was ever there.
+                    auth::revoke_tokens_for(email, &cause);
+                    return Err(GoogleError::AuthRevoked(cause));
                 }
                 Err(e) => return Err(e),
             }
@@ -111,9 +114,15 @@ pub fn get_access_token_for(email: &str) -> Result<String, GoogleError> {
         }
     }
 
-    Err(GoogleError::Auth(format!(
-        "No stored token for {email} — please re-authenticate"
-    )))
+    // Token file is missing. Before claiming none ever existed, check for
+    // a revocation tombstone left by a prior `invalid_grant` — that's the
+    // common case (Google's 7-day refresh-token expiry on Testing-mode
+    // OAuth clients) and the user gets a far more honest message.
+    if let Some(cause) = auth::read_revocation(email) {
+        return Err(GoogleError::AuthRevoked(cause));
+    }
+
+    Err(GoogleError::Auth(format!("No stored token for {email}")))
 }
 
 /// Run a full browser OAuth flow for a new (or switched) account.
@@ -173,5 +182,5 @@ pub fn list_stored_accounts() -> Vec<String> {
 
 /// Remove the stored token for one account, forcing re-authentication.
 pub fn sign_out_account(email: &str) {
-    auth::revoke_tokens_for(email);
+    auth::revoke_tokens_for(email, "Signed out");
 }

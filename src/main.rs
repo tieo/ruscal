@@ -335,6 +335,25 @@ fn status_text(
 /// * `401` / `403` — Google API rejected the access token we sent
 ///
 /// One detector, one UI treatment: the "Re-authenticate" button.
+/// Reduce a raw reauth-shaped error to a clean sentence by trimming
+/// `GoogleError`'s `Display` prefix (`auth: `, `auth revoked: `, `API: `)
+/// and uppercasing the first character. The action ("Re-authenticate") is
+/// already conveyed by the button right next to this text, so it is
+/// deliberately *not* added back into the string.
+fn cleaned_reauth_text(e: &str) -> String {
+    let body = e
+        .strip_prefix("auth revoked: ")
+        .or_else(|| e.strip_prefix("auth: "))
+        .or_else(|| e.strip_prefix("API: "))
+        .unwrap_or(e);
+
+    let mut chars = body.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None        => String::new(),
+    }
+}
+
 fn needs_reauth(e: &str) -> bool {
     e.contains("auth revoked")
         || e.contains("invalid_grant")
@@ -352,7 +371,12 @@ fn friendly_error(e: &str) -> String {
     } else if e.contains("MAPI") {
         format!("Outlook error: {e}")
     } else if needs_reauth(e) {
-        "Google access needs re-authentication — click Re-authenticate below".into()
+        // Strip the internal `Display` prefix from `GoogleError` and
+        // capitalize so the message reads as a plain sentence. The
+        // Re-authenticate button is already visible right next to this
+        // text whenever this branch fires, so we don't need to mention
+        // the action — just describe what Google said.
+        cleaned_reauth_text(e)
     } else {
         format!("Sync error: {e}")
     }
@@ -387,20 +411,33 @@ mod tests {
         }
     }
 
-    /// All reauth cases must map to a single friendly message that mentions
-    /// the Re-authenticate button, so there is exactly one hardcoded string.
+    /// Reauth-shaped errors must be clean sentences: no `GoogleError`
+    /// internal prefix, no em-dashes, no echoing the visible button label.
+    /// Each fixture pairs a raw error with its expected user-facing text.
     #[test]
-    fn friendly_error_gives_one_message_for_all_reauth_cases() {
-        let expected = "Google access needs re-authentication — click Re-authenticate below";
+    fn friendly_error_renders_reauth_as_clean_sentence() {
         let cases = [
-            "auth revoked: refresh token rejected by Google",
-            r#"auth: refresh failed: {"error":"invalid_grant"}"#,
-            "auth: No stored token for foo@bar.com — please re-authenticate",
-            "API: HTTP 401 Unauthorized",
-            "API: HTTP 403 Forbidden",
+            (
+                "auth revoked: refresh token rejected by Google",
+                "Refresh token rejected by Google",
+            ),
+            (
+                r#"auth: refresh failed: {"error":"invalid_grant"}"#,
+                r#"Refresh failed: {"error":"invalid_grant"}"#,
+            ),
+            (
+                "auth: No stored token for foo@bar.com",
+                "No stored token for foo@bar.com",
+            ),
+            ("API: HTTP 401 Unauthorized", "HTTP 401 Unauthorized"),
+            ("API: HTTP 403 Forbidden",    "HTTP 403 Forbidden"),
         ];
-        for raw in cases {
-            assert_eq!(friendly_error(raw), expected, "mismatch for: {raw}");
+        for (raw, expected) in cases {
+            let msg = friendly_error(raw);
+            assert_eq!(msg, expected, "for raw: {raw}");
+            assert!(!msg.contains('—'), "em-dash leaked for: {raw} — got: {msg}");
+            assert!(!msg.contains("Re-authenticate"),
+                "echoes button label for: {raw} — got: {msg}");
         }
     }
 
