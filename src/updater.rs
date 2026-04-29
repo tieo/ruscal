@@ -236,10 +236,10 @@ pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
 // Slint's bookkeeping stays coherent. The secondary instance opens the event,
 // calls `SetEvent`, and exits — it never touches the other process's window.
 
-const FOCUS_EVENT_NAME: &str = "Local\\ruscal_focus_request\0";
+const FOCUS_EVENT_NAME: &str = "Local\\ruscal_focus_request";
 
-fn focus_event_name_wide() -> Vec<u16> {
-    FOCUS_EVENT_NAME.encode_utf16().collect()
+fn wide_event_name(name: &str) -> Vec<u16> {
+    name.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Create the focus-request event and spawn a thread that waits on it,
@@ -253,16 +253,28 @@ pub fn listen_for_focus_requests<F>(on_request: F) -> Option<FocusListener>
 where
     F: Fn() + Send + 'static,
 {
+    listen_for_focus_requests_named(FOCUS_EVENT_NAME, on_request)
+}
+
+/// Like [`listen_for_focus_requests`] but with a caller-supplied event name.
+/// Exists so the integration test can run on a unique name and not collide
+/// with the live primary instance whose listener would otherwise consume
+/// the test's signals (auto-reset events deliver each `SetEvent` to exactly
+/// one waiter, so a parallel listener is fatal).
+fn listen_for_focus_requests_named<F>(name: &str, on_request: F) -> Option<FocusListener>
+where
+    F: Fn() + Send + 'static,
+{
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Threading::CreateEventW;
     use windows::core::PCWSTR;
 
-    let name = focus_event_name_wide();
+    let wide = wide_event_name(name);
     let handle: HANDLE = unsafe {
         // Manual-reset=false → auto-reset after each wait returns. No security
         // attrs: the event lives in the Local\ namespace so only the current
         // logon session can open it.
-        CreateEventW(None, false, false, PCWSTR::from_raw(name.as_ptr())).ok()?
+        CreateEventW(None, false, false, PCWSTR::from_raw(wide.as_ptr())).ok()?
     };
 
     // Cross the thread boundary as an integer. `HANDLE` wraps `*mut c_void`
@@ -303,12 +315,16 @@ impl Drop for FocusListener {
 /// race — this function never touches windows directly, so Slint's state in
 /// the primary instance stays consistent.
 pub fn signal_focus_request() {
+    signal_focus_request_named(FOCUS_EVENT_NAME);
+}
+
+fn signal_focus_request_named(name: &str) {
     use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
     use windows::core::PCWSTR;
 
-    let name = focus_event_name_wide();
+    let wide = wide_event_name(name);
     unsafe {
-        let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(name.as_ptr()))
+        let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(wide.as_ptr()))
         else { return };
         let _ = SetEvent(handle);
         let _ = windows::Win32::Foundation::CloseHandle(handle);
@@ -600,9 +616,23 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        // Use a per-test unique event name so this test never collides
+        // with a live ruscal instance running on the same machine. The
+        // auto-reset event delivers each SetEvent to exactly one waiter,
+        // so a parallel listener (the real app) would otherwise eat our
+        // signals and fail the test non-deterministically.
+        let event_name = format!(
+            "Local\\ruscal_focus_request_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+
         let fired = Arc::new(AtomicU32::new(0));
         let fired_cb = Arc::clone(&fired);
-        let _listener = super::listen_for_focus_requests(move || {
+        let _listener = super::listen_for_focus_requests_named(&event_name, move || {
             fired_cb.fetch_add(1, Ordering::SeqCst);
         }).expect("create focus-request event");
 
@@ -614,9 +644,9 @@ mod tests {
         // action). What matters is that each wait-acknowledged signal is
         // then followed by servicing of the next.
 
-        super::signal_focus_request();
+        super::signal_focus_request_named(&event_name);
         wait_for_count(&fired, 1);
-        super::signal_focus_request();
+        super::signal_focus_request_named(&event_name);
         wait_for_count(&fired, 2);
 
         assert_eq!(fired.load(Ordering::SeqCst), 2);
