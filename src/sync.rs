@@ -160,10 +160,23 @@ fn delete_orphans(
 
 pub enum PutOutcome { Ok, Skipped }
 
-/// PUT an iCalendar event. On 409/403 (Google detected a conflict with an
-/// existing resource at a different URL), return [`PutOutcome::Skipped`] — do
-/// NOT attempt to delete the conflicting resource. The only deletion path in
-/// ruscal is `delete_orphans`, which is strictly limited to ruscal-UID events.
+/// PUT an iCalendar event with automatic 409/403 recovery.
+///
+/// CalDAV PUT returns 409/403 when Google sees an existing event with the
+/// same `iCalUID` at a different URL. That used to be terminal — the event
+/// would be silently skipped on every subsequent sync. For UIDs we wholly
+/// own (the `@ruscal` suffix marks ruscal-generated events; we never mint
+/// that suffix for invite-derived UIDs) we can safely:
+///
+///   1. Look up the conflicting Google event ID via the Calendar v3 API.
+///   2. Delete it.
+///   3. Retry the PUT once.
+///
+/// For non-ruscal UIDs (Gmail-derived invites, manually-created events) we
+/// still bail out as `Skipped`: deleting those would destroy data the user
+/// might rely on. The `@ruscal` whitelist matches `event_uid`'s output and
+/// `delete_orphans`'s safety scope, so no third party can trick us into
+/// deleting their events.
 fn put_with_retry(
     calendar_url: &str,
     uid:          &str,
@@ -171,16 +184,85 @@ fn put_with_retry(
     access_token: &str,
 ) -> Result<PutOutcome, caldav::CalDavError> {
     match caldav::put_event(calendar_url, uid, ical, access_token) {
+        Ok(()) => return Ok(PutOutcome::Ok),
+        Err(e) if e.http_status() == Some(409) || e.http_status() == Some(403) => {
+            if !uid.ends_with("@ruscal") {
+                log::warn!(
+                    "{uid}: PUT returned {} — non-ruscal UID, skipping (no auto-cleanup)",
+                    e.http_status().unwrap()
+                );
+                return Ok(PutOutcome::Skipped);
+            }
+            // Fall through to the auto-recovery path below.
+            log::info!("{uid}: PUT 409/403 — auto-recovering by deleting Google duplicate");
+        }
+        Err(e) => return Err(e),
+    }
+
+    // ── Auto-recovery: delete the conflicting Google event, then retry. ────────
+    let removed = match delete_google_events_by_ical_uid(uid, access_token) {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("{uid}: lookup/delete via v3 API failed ({e}); skipping");
+            return Ok(PutOutcome::Skipped);
+        }
+    };
+    if removed == 0 {
+        // 409 with no v3-visible duplicate is unusual but possible (Google
+        // race during the lookup). Skip cleanly rather than retrying blindly.
+        log::warn!("{uid}: 409 but no duplicate found via v3 API; skipping");
+        return Ok(PutOutcome::Skipped);
+    }
+    log::info!("{uid}: removed {removed} Google duplicate(s), retrying PUT");
+
+    // Retry exactly once. If it still 409/403s, give up to avoid loops.
+    match caldav::put_event(calendar_url, uid, ical, access_token) {
         Ok(()) => Ok(PutOutcome::Ok),
         Err(e) if e.http_status() == Some(409) || e.http_status() == Some(403) => {
-            log::warn!(
-                "{uid}: PUT returned {} — skipping this event (no automatic cleanup)",
-                e.http_status().unwrap()
-            );
+            log::warn!("{uid}: still 409/403 after cleanup; giving up");
             Ok(PutOutcome::Skipped)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Find every Google Calendar event with the given `iCalUID` and delete it
+/// via the Calendar v3 API. Returns the number of events deleted.
+///
+/// Used by [`put_with_retry`] to clear a 409/403 conflict before retrying
+/// the CalDAV PUT. The caller is responsible for restricting this to UIDs
+/// ruscal owns (the `@ruscal` whitelist).
+fn delete_google_events_by_ical_uid(
+    ical_uid:     &str,
+    access_token: &str,
+) -> Result<usize, String> {
+    let client = reqwest::blocking::Client::new();
+    let list_url = format!(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+         ?iCalUID={ical_uid}&maxResults=10&showDeleted=false");
+    let resp = client.get(&list_url).bearer_auth(access_token)
+        .send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("v3 list returned {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let Some(items) = json["items"].as_array() else { return Ok(0) };
+
+    let mut deleted = 0usize;
+    for item in items {
+        let Some(id) = item["id"].as_str() else { continue };
+        let del_url = format!(
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events/{id}");
+        let r = client.delete(&del_url).bearer_auth(access_token)
+            .send().map_err(|e| e.to_string())?;
+        // 410 (already gone) is success for our purposes.
+        if r.status().is_success() || r.status().as_u16() == 410 {
+            deleted += 1;
+        } else {
+            return Err(format!("v3 delete {id} returned {}", r.status()));
+        }
+    }
+    Ok(deleted)
 }
 
 // ── UID ───────────────────────────────────────────────────────────────────────
@@ -796,22 +878,66 @@ fn escape(s: &str) -> String {
 }
 
 fn folded(line: String) -> String {
-    let bytes = line.as_bytes();
-    if bytes.len() <= 75 { return line; }
+    if line.len() <= 75 { return line; }
     let mut out = String::with_capacity(line.len() + (line.len() / 74) * 3);
     let mut pos = 0;
-    while pos < bytes.len() {
-        let max   = if pos == 0 { 75 } else { 74 };
-        let end   = (pos + max).min(bytes.len());
-        let split = (pos..=end).rev()
-            .find(|&i| i == pos || (bytes[i - 1] & 0xC0) != 0x80)
-            .unwrap_or(end);
+    while pos < line.len() {
+        let max = if pos == 0 { 75 } else { 74 };
+        let end = (pos + max).min(line.len());
+        // RFC 5545 caps lines at 75 octets, but a fold inside a multi-byte
+        // UTF-8 codepoint produces invalid output (and crashes any slicer).
+        // Walk back from `end` to the largest char boundary we can split at.
+        // `is_char_boundary` returns true at 0, at `len`, and on every
+        // leading byte of a UTF-8 sequence.
+        let mut split = end;
+        while split > pos && !line.is_char_boundary(split) {
+            split -= 1;
+        }
         if pos > 0 { out.push(' '); }
         out.push_str(&line[pos..split]);
         pos = split;
-        if pos < bytes.len() { out.push_str("\r\n"); }
+        if pos < line.len() { out.push_str("\r\n"); }
     }
     out
+}
+
+#[cfg(test)]
+mod folded_tests {
+    use super::folded;
+
+    /// Regression: an earlier version inspected `bytes[i - 1]` for UTF-8
+    /// continuation, which let the folder split *inside* a multi-byte
+    /// codepoint and panic with "byte index N is not a char boundary".
+    /// The MAPI body fallback surfaced this on the user's German calendar
+    /// (long Teams invite with `ü`/`ö`/`ä`).
+    #[test]
+    fn folds_long_utf8_lines_without_splitting_codepoints() {
+        // Ensure 'ü' lands across a 75-byte boundary by padding.
+        let mut s = String::from("DESCRIPTION:");
+        for _ in 0..30 { s.push_str("ABCDE"); }
+        s.push('ü');
+        for _ in 0..50 { s.push_str("XYZW"); }
+
+        let folded = folded(s.clone());
+
+        // Reconstruct the unfolded payload to compare with the original:
+        // each fold inserts CRLF + a leading space.
+        let unfolded = folded.replace("\r\n ", "");
+        assert_eq!(unfolded, s);
+
+        for line in folded.split("\r\n") {
+            assert!(line.len() <= 75, "line over 75 octets: {} bytes", line.len());
+            assert!(std::str::from_utf8(line.as_bytes()).is_ok(),
+                "fold produced invalid UTF-8");
+        }
+    }
+
+    /// Short lines (under the 75-octet cap) are returned unchanged.
+    #[test]
+    fn short_lines_pass_through_unchanged() {
+        let s = String::from("SUMMARY:Hello world ümlauts");
+        assert_eq!(folded(s.clone()), s);
+    }
 }
 
 // ── Integration tests ─────────────────────────────────────────────────────────
@@ -1969,5 +2095,462 @@ mod integration {
                 // ARO_EXCEPTIONAL_BODY (0x0200) — no extra data
             }
         }
+    }
+
+    /// Verifies the organizer-resolution fix end-to-end against a live Outlook
+    /// profile. For every event in the sync window, prints:
+    ///   * `subject` (truncated)
+    ///   * resolved `organizer_name` and `organizer_email` (after the
+    ///     `SENT_REPRESENTING` → `SENDER` fallback + X.500 filter)
+    ///   * what `build_description` will prepend
+    ///
+    /// Then reports counts:
+    ///   * events with an organizer line that includes an SMTP address (good)
+    ///   * events with a name-only organizer line (still useful)
+    ///   * events with NO organizer line at all (regressions or genuinely
+    ///     anonymous appointments)
+    ///
+    /// Locally only — never touches Google. Run with:
+    ///   cargo test --release test_verify_organizer_fix -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires live Outlook"]
+    fn test_verify_organizer_fix() {
+        let now = Utc::now();
+        let events = crate::outlook::read_calendar_events(
+            now - chrono::Duration::days(crate::outlook::DEFAULT_PAST_DAYS),
+            now + chrono::Duration::days(crate::outlook::DEFAULT_FUTURE_DAYS),
+        ).expect("Outlook read");
+
+        let mut with_email = 0usize;
+        let mut name_only  = 0usize;
+        let mut none       = 0usize;
+        let mut x500_leaks = 0usize;
+
+        println!("\n{} events in window\n", events.len());
+        println!("{:<50} | {:<28} | {:<32} | desc-line", "subject", "organizer_name", "organizer_email");
+        println!("{}", "-".repeat(140));
+
+        for e in &events {
+            let trunc = |s: &str, n: usize| -> String {
+                if s.chars().count() <= n { s.to_owned() } else {
+                    format!("{}…", s.chars().take(n - 1).collect::<String>())
+                }
+            };
+
+            let desc = super::build_description(e);
+            let first_line = desc.lines().next().unwrap_or("").to_owned();
+
+            // Categorise.
+            if e.organizer_email.starts_with('/') {
+                x500_leaks += 1; // should be impossible after fix
+            }
+            if !e.organizer_email.is_empty() {
+                with_email += 1;
+            } else if !e.organizer_name.is_empty() {
+                name_only += 1;
+            } else {
+                none += 1;
+            }
+
+            println!(
+                "{:<50} | {:<28} | {:<32} | {}",
+                trunc(&e.subject, 50),
+                trunc(&e.organizer_name, 28),
+                trunc(&e.organizer_email, 32),
+                trunc(&first_line, 60),
+            );
+        }
+
+        println!("\n=== Summary ===");
+        println!("  with SMTP email:  {with_email}");
+        println!("  name-only:        {name_only}");
+        println!("  no organizer:     {none}");
+        println!("  X.500 leaks:      {x500_leaks}  (must be 0)");
+
+        assert_eq!(x500_leaks, 0,
+            "fix regressed: X.500/EX address leaked into organizer_email");
+    }
+
+    /// Regression: `put_with_retry` must auto-recover from a 409/403 by
+    /// finding the conflicting Google event via the v3 API and deleting it
+    /// before retrying the CalDAV PUT. Before this, every collision turned
+    /// into a permanent "events skipped" warning that the user had to
+    /// resolve manually in Google Calendar.
+    ///
+    /// Approach:
+    ///   1. PUT a fresh `@ruscal` event via v3 API insert (Google places it
+    ///      at some Calendar-managed URL, NOT a CalDAV one).
+    ///   2. Call `put_with_retry` for the *same* iCalUID at a CalDAV URL.
+    ///      Google returns 409 because it already has the iCalUID.
+    ///   3. Expect `PutOutcome::Ok` (auto-recovery succeeded).
+    ///   4. Verify exactly one event with that iCalUID exists, and its
+    ///      summary is the new value.
+    ///
+    /// Run with:
+    ///   cargo test --release test_put_recovers_from_409 -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires live Google credentials"]
+    fn test_put_recovers_from_409() {
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let dest_id = cfg["pairs"][0]["dest_id"].as_str().unwrap().to_owned();
+        let gmail   = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token   = crate::google::get_access_token_for(&gmail).expect("token");
+
+        // Use a unique UID so the test never collides with real events.
+        let uid = format!("ruscal-409recover-{}@ruscal",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+
+        // ── 1. Seed a Google copy via the v3 API ───────────────────────────────
+        let client = reqwest::blocking::Client::new();
+        let insert_body = serde_json::json!({
+            "summary":     "BEFORE auto-recovery",
+            "description": "seeded by test_put_recovers_from_409",
+            "start":       {"dateTime": "2026-09-15T10:00:00Z"},
+            "end":         {"dateTime": "2026-09-15T11:00:00Z"},
+            "iCalUID":     &uid,
+        });
+        let resp = client
+            .post("https://www.googleapis.com/calendar/v3/calendars/primary/events")
+            .bearer_auth(&token).json(&insert_body)
+            .send().expect("v3 insert");
+        assert!(resp.status().is_success(), "seed insert failed: {}", resp.status());
+
+        // Give Google a moment to index it.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // ── 2. Call put_with_retry — this is what would 409 without the fix ────
+        let new_ical = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ruscal//ruscal//EN\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:{uid}\r\nDTSTAMP:20260901T000000Z\r\n\
+             DTSTART:20260915T100000Z\r\nDTEND:20260915T110000Z\r\n\
+             SUMMARY:AFTER auto-recovery\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n");
+
+        let outcome = put_with_retry(&dest_id, &uid, &new_ical, &token)
+            .expect("put_with_retry should not error");
+        match outcome {
+            PutOutcome::Ok => println!("auto-recovery: Ok"),
+            PutOutcome::Skipped => panic!("PUT was skipped — auto-recovery did not run"),
+        }
+
+        // ── 3. Verify exactly one event with this UID, summary updated ─────────
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let url = format!(
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+             ?iCalUID={uid}&maxResults=5&showDeleted=false");
+        let json: serde_json::Value = client.get(&url)
+            .bearer_auth(&token).send().expect("list").json().expect("json");
+        let items = json["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "should be exactly one event with this UID, got {}", items.len());
+        assert_eq!(
+            items[0]["summary"].as_str(), Some("AFTER auto-recovery"),
+            "Google's copy should now be the post-recovery PUT version",
+        );
+
+        // ── 4. Cleanup ─────────────────────────────────────────────────────────
+        let _ = crate::caldav::delete_event(&dest_id, &uid, &token);
+    }
+
+    /// Fetches the user's May 5 event from Google and prints its full
+    /// description verbatim, plus the corresponding Outlook body length so
+    /// we can spot truncation by comparison.
+    ///
+    /// Run with:
+    ///   cargo test --release test_dump_may5_description -- --ignored --nocapture
+    #[test]
+    #[ignore = "ad-hoc; requires live Outlook + Google credentials"]
+    fn test_dump_may5_description() {
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let gmail = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let token = crate::google::get_access_token_for(&gmail).expect("token");
+
+        // Outlook copy: use this as the ground-truth body length.
+        let now = Utc::now();
+        let events = crate::outlook::read_calendar_events(
+            now - chrono::Duration::days(crate::outlook::DEFAULT_PAST_DAYS),
+            now + chrono::Duration::days(crate::outlook::DEFAULT_FUTURE_DAYS),
+        ).expect("Outlook read");
+
+        let may5 = chrono::NaiveDate::from_ymd_opt(2026, 5, 5).unwrap();
+        let outlook_may5: Vec<_> = events.iter().filter(|e| {
+            e.start.with_timezone(&chrono::Local).date_naive() == may5
+        }).collect();
+
+        println!("\n=== Outlook events on 2026-05-05 ===");
+        for e in &outlook_may5 {
+            println!("  '{}' — body {} chars, {} lines",
+                e.subject, e.body.chars().count(), e.body.lines().count());
+        }
+
+        // Google copy: fetch via API.
+        let client = reqwest::blocking::Client::new();
+        let mut all_items: Vec<serde_json::Value> = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = String::from(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+                 ?timeMin=2026-05-04T00:00:00Z&timeMax=2026-05-06T23:59:59Z\
+                 &maxResults=2500&showDeleted=false&singleEvents=true");
+            if let Some(t) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(t);
+            }
+            let resp: serde_json::Value = client.get(&url)
+                .bearer_auth(&token).send().expect("list").json().expect("json");
+            if let Some(items) = resp["items"].as_array() {
+                all_items.extend(items.iter().cloned());
+            }
+            page_token = resp["nextPageToken"].as_str().map(str::to_owned);
+            if page_token.is_none() { break; }
+        }
+
+        // Match Outlook events to Google events by iCalUID.
+        for e in &outlook_may5 {
+            let uid = event_uid(e);
+            println!("\n────────────────────────────────────────────────");
+            println!("Outlook UID: {uid}");
+            println!("Outlook subject: {}", e.subject);
+            println!("Outlook body ({} chars):", e.body.chars().count());
+            println!("---");
+            println!("{}", e.body);
+            println!("---");
+
+            let google_match = all_items.iter().find(|g|
+                g["iCalUID"].as_str() == Some(&uid)
+            );
+            match google_match {
+                Some(g) => {
+                    let desc = g["description"].as_str().unwrap_or("(no description)");
+                    println!("\nGoogle iCalUID: {}", g["iCalUID"].as_str().unwrap_or("?"));
+                    println!("Google summary: {}", g["summary"].as_str().unwrap_or("?"));
+                    println!("Google description ({} chars):", desc.chars().count());
+                    println!("---");
+                    println!("{desc}");
+                    println!("---");
+
+                    // Subtract the synthetic "Organizer: ..." prefix line + the
+                    // blank separator line so the lengths line up.
+                    let prefix = build_description(e);
+                    let prefix_len = prefix.chars().count();
+                    let body_len   = e.body.chars().count();
+                    println!("\nExpected description length (organizer + body): {}", prefix_len);
+                    println!("Actual Google description length:                {}", desc.chars().count());
+
+                    let _ = body_len;
+                }
+                None => println!("\nNot found in Google."),
+            }
+        }
+    }
+
+    /// End-to-end verification that `Organizer:` lines actually land in
+    /// Google. Triggers a fresh sync, then fetches every ruscal-managed
+    /// event from Google and asserts each one has a description that
+    /// includes an `Organizer:` line.
+    ///
+    /// Run with:
+    ///   cargo test --release test_verify_google_descriptions -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires live Outlook + Google credentials"]
+    fn test_verify_google_descriptions() {
+        // ── 1. Load config and credentials ─────────────────────────────────────
+        let cfg_path = dirs::data_local_dir().unwrap().join("ruscal").join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let dest_id = cfg["pairs"][0]["dest_id"].as_str().unwrap().to_owned();
+        let gmail   = cfg["pairs"][0]["google_email"].as_str().unwrap().to_owned();
+        let source  = cfg["pairs"][0]["source_account"].as_str().unwrap().to_owned();
+        let token   = crate::google::get_access_token_for(&gmail).expect("google token");
+        let pair_id = crate::state::pair_id(&source, &dest_id);
+
+        // ── 2. Read Outlook to know which UIDs we expect in Google ─────────────
+        let now = Utc::now();
+        let events = crate::outlook::read_calendar_events(
+            now - chrono::Duration::days(crate::outlook::DEFAULT_PAST_DAYS),
+            now + chrono::Duration::days(crate::outlook::DEFAULT_FUTURE_DAYS),
+        ).expect("Outlook read");
+        // Mirror the run_sync filter so our expected set matches what's PUT.
+        let events: Vec<_> = events.into_iter()
+            .filter(|e| e.response_status != crate::event::ResponseStatus::Declined)
+            .collect();
+        println!("Outlook returned {} non-declined events", events.len());
+
+        // Map iCalUID → expected (subject, organizer_name, organizer_email).
+        let mut expected: std::collections::HashMap<String, (String, String, String)> =
+            Default::default();
+        for e in &events {
+            expected.insert(
+                event_uid(e),
+                (e.subject.clone(), e.organizer_name.clone(), e.organizer_email.clone()),
+            );
+        }
+
+        // ── 3. Force a fresh sync so Google has the latest data ────────────────
+        // Clear the hash cache too: we want every event re-PUT. 409 conflicts
+        // (if any remain from prior tooling) are now self-healing in
+        // `put_with_retry` — see `test_put_recovers_from_409` for direct proof.
+        let mut state = crate::state::load_pair(&pair_id);
+        state.hash_cache.clear();
+        crate::state::save_pair(&pair_id, state);
+
+        let report = run_sync(&pair_id, &dest_id, &token).expect("run_sync");
+        println!("Sync: synced={} skipped={:?}", report.synced, report.skipped_titles);
+
+        // After a clean preclean+sync nothing should remain skipped. Skips
+        // here mean Google still rejected the PUT — usually a UID variant we
+        // didn't preclean (the bug the user surfaced as "3 events skipped").
+        assert!(report.skipped_titles.is_empty(),
+            "sync still reports skips after preclean: {:?}", report.skipped_titles);
+
+        // Give Google a moment to index the freshly PUT resources before we
+        // GET them back.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // ── 4. Pull all ruscal-managed events from Google ──────────────────────
+        let client = reqwest::blocking::Client::new();
+        let mut google_items: Vec<serde_json::Value> = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = String::from(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+                 ?maxResults=2500&showDeleted=false&singleEvents=false");
+            if let Some(t) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(t);
+            }
+            let resp: serde_json::Value = client.get(&url)
+                .bearer_auth(&token).send().expect("list").json().expect("json");
+            if let Some(items) = resp["items"].as_array() {
+                google_items.extend(items.iter().cloned());
+            }
+            page_token = resp["nextPageToken"].as_str().map(str::to_owned);
+            if page_token.is_none() { break; }
+        }
+
+        // Index Google events by iCalUID for direct matching.
+        let mut by_uid: std::collections::HashMap<String, &serde_json::Value> = Default::default();
+        for e in &google_items {
+            if let Some(uid) = e["iCalUID"].as_str() {
+                by_uid.insert(uid.to_owned(), e);
+            }
+        }
+
+        // ── 5. Verify each expected event landed with an Organizer line ────────
+        let mut total       = 0usize;
+        let mut missing     = 0usize;
+        let mut no_desc     = 0usize;
+        let mut no_org_line = 0usize;
+        let mut good        = 0usize;
+
+        let trunc = |s: &str, n: usize| -> String {
+            if s.chars().count() <= n { s.to_owned() } else {
+                format!("{}…", s.chars().take(n - 1).collect::<String>())
+            }
+        };
+
+        println!("\n{:<50} | {:<7} | desc-line", "subject", "status");
+        println!("{}", "-".repeat(120));
+
+        for (uid, (subject, _org_name, _org_email)) in &expected {
+            total += 1;
+            let Some(g) = by_uid.get(uid) else {
+                missing += 1;
+                println!("{:<50} | MISS    | (not in Google)", trunc(subject, 50));
+                continue;
+            };
+            let desc = g["description"].as_str().unwrap_or("");
+            if desc.is_empty() {
+                no_desc += 1;
+                println!("{:<50} | NODESC  | (empty description)", trunc(subject, 50));
+                continue;
+            }
+            let first_line = desc.lines().next().unwrap_or("");
+            if !first_line.starts_with("Organizer:") {
+                no_org_line += 1;
+                println!("{:<50} | NOORG   | {}", trunc(subject, 50), trunc(first_line, 60));
+                continue;
+            }
+            good += 1;
+            println!("{:<50} | OK      | {}", trunc(subject, 50), trunc(first_line, 60));
+        }
+
+        println!("\n=== Google-side summary ===");
+        println!("  total Outlook events:    {total}");
+        println!("  with Organizer line:     {good}");
+        println!("  description w/o line:    {no_org_line}");
+        println!("  no description at all:   {no_desc}");
+        println!("  not present in Google:   {missing}");
+
+        assert_eq!(no_org_line, 0,
+            "{} Google events have a description but no Organizer: line", no_org_line);
+        assert_eq!(no_desc, 0,
+            "{} Google events have an empty description", no_desc);
+
+        // Also assert: no Outlook body looks truncated at the MAPI 255-char
+        // cutoff. If the table-row fallback regresses, this is the first
+        // place it'll show up.
+        for e in &events {
+            let n = e.body.chars().count();
+            assert_ne!(n, 255,
+                "Outlook body for '{}' is exactly 255 chars — table-row truncation likely",
+                e.subject);
+        }
+
+        // Cross-check: every Outlook body length should equal what the
+        // corresponding Google event has minus the synthetic prefix.
+        // Re-fetch via the Calendar v3 API to catch the post-sync state.
+        let mut body_mismatches = 0;
+        let v3_client = reqwest::blocking::Client::new();
+        for e in &events {
+            let uid = event_uid(e);
+            let url = format!(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events\
+                 ?iCalUID={uid}&maxResults=2&showDeleted=false");
+            let Ok(resp) = v3_client.get(&url).bearer_auth(&token).send() else { continue };
+            let Ok(json) = resp.json::<serde_json::Value>() else { continue };
+            let Some(items) = json["items"].as_array() else { continue };
+            let Some(g) = items.first() else { continue };
+
+            let google_desc = g["description"].as_str().unwrap_or("");
+            let expected = build_description(e);
+
+            // Normalize trailing whitespace per line: Google strips trailing
+            // spaces from each line on round-trip (harmless, but causes a
+            // false "mismatch" on the raw byte comparison).
+            let normalize = |s: &str| -> String {
+                s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
+                    .trim_end().to_owned()
+            };
+
+            if normalize(google_desc) != normalize(&expected) {
+                body_mismatches += 1;
+                println!("\nBODY MISMATCH on '{}':", e.subject);
+                println!("  Outlook body chars:    {}", e.body.chars().count());
+                println!("  Expected (normalized): {}", normalize(&expected).chars().count());
+                println!("  Google   (normalized): {}", normalize(google_desc).chars().count());
+
+                // Show the first divergence so we can see what's actually different.
+                let n_exp: Vec<char> = normalize(&expected).chars().collect();
+                let n_got: Vec<char> = normalize(google_desc).chars().collect();
+                let diff_at = (0..n_exp.len().min(n_got.len()))
+                    .find(|&i| n_exp[i] != n_got[i])
+                    .unwrap_or(n_exp.len().min(n_got.len()));
+                let lo = diff_at.saturating_sub(40);
+                let hi_e = (diff_at + 40).min(n_exp.len());
+                let hi_g = (diff_at + 40).min(n_got.len());
+                println!("  divergence at char {diff_at}");
+                println!("    expected ...|{}", n_exp[lo..hi_e].iter().collect::<String>().replace('\n', "⏎"));
+                println!("    google   ...|{}", n_got[lo..hi_g].iter().collect::<String>().replace('\n', "⏎"));
+            }
+        }
+        assert_eq!(body_mismatches, 0,
+            "{body_mismatches} events have Google descriptions that don't match what \
+             ruscal would now PUT (after whitespace normalization)");
     }
 }
