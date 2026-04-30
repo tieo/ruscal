@@ -41,6 +41,23 @@ pub const PR_SENSITIVITY: u32         = 0x00360003;
 pub const PR_SENDER_NAME_W: u32       = 0x0C1A001F;
 pub const PR_SENDER_SMTP_ADDRESS: u32 = 0x5D01001F;
 
+/// "Sent on behalf of" name. For meeting invites this equals the organizer;
+/// for self-created appointments it equals the mailbox owner. Use this in
+/// preference to `PR_SENDER_NAME_W`, which is unreliable on appointments that
+/// never crossed the wire.
+pub const PR_SENT_REPRESENTING_NAME_W: u32         = 0x0042001F;
+/// SMTP form of the sent-representing address (the X.500 form is in 0x0065001F
+/// but is useless for end-users; we don't read it).
+pub const PR_SENT_REPRESENTING_SMTP_ADDRESS: u32   = 0x5D02001F;
+
+/// Display name of whoever last edited the item. Used as the final fallback
+/// for the organizer line when all four `SENDER_*` / `SENT_REPRESENTING_*`
+/// properties are empty — for events that have never been "sent" (PowerShell-
+/// created, unsent meeting drafts), the last modifier IS the calendar owner.
+/// For invites already-touched-by-the-user we never reach this fallback
+/// because `SENT_REPRESENTING_*` will be populated by the original sender.
+pub const PR_LAST_MODIFIER_NAME_W: u32             = 0x3FFA001F;
+
 // ── Named property GUIDs ──────────────────────────────────────────────────────
 
 /// `PSETID_Appointment` — contains location, all-day, busy status, recurrence, etc.

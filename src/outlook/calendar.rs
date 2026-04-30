@@ -33,8 +33,10 @@ use super::props::{
     self, build_tag_array, datetime_to_filetime, read_binary, read_bool,
     read_filetime, read_long, read_str8, read_unicode,
     NamedProps, PR_BODY_W, PR_CONTAINER_CLASS, PR_DISPLAY_NAME, PR_DISPLAY_NAME_W,
-    PR_END_DATE, PR_ENTRYID, PR_IPM_SUBTREE_ENTRYID, PR_SENDER_NAME_W,
-    PR_SENDER_SMTP_ADDRESS, PR_SENSITIVITY, PR_START_DATE, PR_SUBJECT_W,
+    PR_END_DATE, PR_ENTRYID, PR_IPM_SUBTREE_ENTRYID, PR_LAST_MODIFIER_NAME_W,
+    PR_SENDER_NAME_W, PR_SENDER_SMTP_ADDRESS, PR_SENSITIVITY,
+    PR_SENT_REPRESENTING_NAME_W, PR_SENT_REPRESENTING_SMTP_ADDRESS,
+    PR_START_DATE, PR_SUBJECT_W,
 };
 use super::session::IMAPISession;
 use crate::error::{check_hr, MapiError};
@@ -353,17 +355,23 @@ pub unsafe fn read_events(
         .map_err(|e| MapiError(e.code().0 as u32))?;
 
     // Column order — indices are used when parsing rows below.
-    // 0  PR_SUBJECT_W          6  PR_SENDER_SMTP_ADDRESS   12 named.clip_end
-    // 1  PR_START_DATE         7  named.location           13 named.clean_global_id
-    // 2  PR_END_DATE           8  named.all_day            14 named.appt_recur
-    // 3  PR_BODY_W             9  named.busy_status        15 PR_ENTRYID (fallback)
-    // 4  PR_SENSITIVITY        10 named.response_status
-    // 5  PR_SENDER_NAME_W      11 named.recurring
+    // 0  PR_SUBJECT_W          6  PR_SENDER_SMTP_ADDRESS         12 named.clip_end
+    // 1  PR_START_DATE         7  named.location                 13 named.clean_global_id
+    // 2  PR_END_DATE           8  named.all_day                  14 named.appt_recur
+    // 3  PR_BODY_W             9  named.busy_status              15 PR_ENTRYID (fallback)
+    // 4  PR_SENSITIVITY        10 named.response_status          16 PR_SENT_REPRESENTING_NAME_W
+    // 5  PR_SENDER_NAME_W      11 named.recurring                17 PR_SENT_REPRESENTING_SMTP_ADDRESS
+    //                                                            18 PR_LAST_MODIFIER_NAME_W
     //
     // We request the PT_UNICODE (_W) variants so Outlook returns proper UTF-16
     // strings. The ANSI (PT_STRING8) variants return CP1252 bytes on Western
     // Windows, which we were previously mis-decoding as UTF-8 — mangling
     // umlauts (ä/ö/ü/ß) into U+FFFD replacement characters on the Google side.
+    //
+    // Organizer resolution priority: SENT_REPRESENTING (16-17) → SENDER (5-6)
+    // → LAST_MODIFIER (18). The last fallback covers events with no sender
+    // info at all (PowerShell-created, unsent drafts) — for those, the
+    // calendar owner is the only sensible answer.
     let mut cols = build_tag_array(&[
         PR_SUBJECT_W, PR_START_DATE, PR_END_DATE, PR_BODY_W, PR_SENSITIVITY,
         PR_SENDER_NAME_W, PR_SENDER_SMTP_ADDRESS,
@@ -371,6 +379,9 @@ pub unsafe fn read_events(
         named.response_status, named.recurring, named.clip_end,
         named.clean_global_id, named.appt_recur,
         PR_ENTRYID, // column 15 — needed to open message if appt_recur missing from table
+        PR_SENT_REPRESENTING_NAME_W,
+        PR_SENT_REPRESENTING_SMTP_ADDRESS,
+        PR_LAST_MODIFIER_NAME_W,
     ]);
 
     let mut rows: *mut SRowSet = core::ptr::null_mut();
@@ -411,14 +422,49 @@ pub unsafe fn read_events(
             None
         };
 
+        // Prefer sent-representing over sender for the organizer line:
+        // SENDER is reliable on meetings sent by others but commonly empty
+        // (or returns an unusable Exchange X.500 address) on appointments the
+        // user created themselves. SENT_REPRESENTING is populated for both.
+        let sender_name        = unsafe { read_unicode(&p[5],  PR_SENDER_NAME_W,                  "") };
+        let sender_email       = unsafe { read_unicode(&p[6],  PR_SENDER_SMTP_ADDRESS,            "") };
+        let representing_name  = if p.len() > 16 {
+            unsafe { read_unicode(&p[16], PR_SENT_REPRESENTING_NAME_W,            "") }
+        } else { String::new() };
+        let representing_email = if p.len() > 17 {
+            unsafe { read_unicode(&p[17], PR_SENT_REPRESENTING_SMTP_ADDRESS,      "") }
+        } else { String::new() };
+        let last_modifier_name = if p.len() > 18 {
+            unsafe { read_unicode(&p[18], PR_LAST_MODIFIER_NAME_W,                "") }
+        } else { String::new() };
+        let (organizer_name, organizer_email) = resolve_organizer(
+            &representing_name, &representing_email,
+            &sender_name,       &sender_email,
+            &last_modifier_name,
+        );
+
+        // Read body from the row. MAPI table rows truncate `PR_BODY_W` at
+        // 255 characters (same default-buffer gotcha as `recur_blob`), so if
+        // the row gives us a string at exactly the cutoff we open the
+        // message and fetch the property in full.
+        let body_row = unsafe { read_unicode(&p[3], PR_BODY_W, "") };
+        let body = if body_row.chars().count() >= 255 && p.len() > 15 {
+            log::debug!("body truncated for '{}' ({}); refetching",
+                unsafe { read_unicode(&p[0], PR_SUBJECT_W, "") },
+                body_row.chars().count());
+            unsafe { fetch_body(store, &p[15]) }.unwrap_or(body_row)
+        } else {
+            body_row
+        };
+
         events.push(CalendarEvent {
             subject:         unsafe { read_unicode(&p[0],  PR_SUBJECT_W,            "(no subject)") },
             start:           unsafe { read_filetime(&p[1], PR_START_DATE) },
             end:             unsafe { read_filetime(&p[2], PR_END_DATE) },
-            body:            unsafe { read_unicode(&p[3],  PR_BODY_W,               "") },
+            body,
             sensitivity:     Sensitivity::from(unsafe { read_long(&p[4], PR_SENSITIVITY, 0) }),
-            organizer_name:  unsafe { read_unicode(&p[5],  PR_SENDER_NAME_W,        "") },
-            organizer_email: unsafe { read_unicode(&p[6],  PR_SENDER_SMTP_ADDRESS,  "") },
+            organizer_name,
+            organizer_email,
             location:        unsafe { read_unicode(&p[7],  named.location,          "") },
             is_all_day:      unsafe { read_bool(&p[8],    named.all_day,           false) },
             busy_status:     BusyStatus::from(unsafe { read_long(&p[9],  named.busy_status,     2) }),
@@ -494,5 +540,223 @@ unsafe fn fetch_recur_blob(
     // prop_ptr is MAPI-allocated; should be freed with MAPIFreeBuffer.
     // Omitted here — bounded small leak per recurring event, consistent with
     // the existing HrGetOneProp usage pattern in open_calendar_folder.
+
+    // Release the IMessage. Leaving it wrapped in ManuallyDrop leaks a COM
+    // ref; on MAPI session teardown that triggers STATUS_ACCESS_VIOLATION
+    // because the provider tries to clean up while we're still holding refs.
+    drop(ManuallyDrop::into_inner(msg));
     blob
+}
+
+/// Open a MAPI message by its entry ID and read `PR_BODY_W` directly.
+///
+/// MAPI table rows truncate string properties at a provider-dependent default
+/// (255 characters for Outlook). Long event bodies come back snipped mid-word.
+/// This fallback opens the message and reads the property in full via
+/// `HrGetOneProp`, which doesn't impose the row-buffer limit.
+///
+/// Returns `Some(full_body)` on success, `None` if the OpenEntry/GetProp
+/// chain fails (caller falls back to the truncated row value rather than
+/// dropping data entirely).
+///
+/// # Safety
+/// Must be called on the MAPI thread. `eid_prop` must be a valid `SPropValue`.
+unsafe fn fetch_body(store: &IMsgStore, eid_prop: &SPropValue) -> Option<String> {
+    if eid_prop.ulPropTag != PR_ENTRYID { return None; }
+    let eid = unsafe { &eid_prop.Value.bin };
+
+    let mut obj_type = 0u32;
+    let mut raw: Option<windows::core::IUnknown> = None;
+    if unsafe {
+        store.OpenEntry(eid.cb, eid.lpb as *const _, None, 0, &mut obj_type, &mut raw)
+    }.is_err() {
+        log::debug!("fetch_body: OpenEntry failed");
+        return None;
+    }
+    let msg_unk = raw?;
+
+    // Same vtable-shape transmute as `fetch_recur_blob` — both `IMessage` and
+    // `IMAPIFolder` derive from `IMAPIProp`, and `HrGetOneProp` only invokes
+    // `IMAPIProp::GetProps`.
+    let msg = ManuallyDrop::new(unsafe {
+        core::mem::transmute::<windows::core::IUnknown, IMAPIFolder>(msg_unk)
+    });
+
+    let mut prop_ptr: *mut SPropValue = core::ptr::null_mut();
+    if unsafe { HrGetOneProp(&*msg, PR_BODY_W, &mut prop_ptr) }.is_err()
+        || prop_ptr.is_null()
+    {
+        log::debug!("fetch_body: HrGetOneProp failed");
+        return None;
+    }
+
+    let body = unsafe { read_unicode(&*prop_ptr, PR_BODY_W, "") };
+    log::debug!("fetch_body: got {} chars", body.chars().count());
+    // prop_ptr is MAPI-allocated; bounded one-time leak per truncated body,
+    // consistent with the existing HrGetOneProp usage in fetch_recur_blob.
+
+    // Release the IMessage so the MAPI session shuts down cleanly.
+    drop(ManuallyDrop::into_inner(msg));
+    Some(body)
+}
+
+/// Pick the (name, email) pair to surface as the event's organizer.
+///
+/// MAPI exposes two parallel sender concepts on calendar items:
+/// * `PR_SENDER_*`             — who actually transmitted the MAPI message,
+/// * `PR_SENT_REPRESENTING_*`  — who the message represents.
+///
+/// On meeting invites *from* others both equal the organizer. On appointments
+/// the user created on their *own* calendar, `SENDER` is commonly empty (no
+/// invite ever crossed the wire) or returns an Exchange X.500 / EX address
+/// (`/o=ExchangeLabs/ou=…/cn=…`), while `SENT_REPRESENTING` correctly equals
+/// the mailbox owner.
+///
+/// Resolution order:
+///   1. `SENT_REPRESENTING` (the message's logical sender)
+///   2. `SENDER` (transmitting principal — populated only on real invites)
+///   3. `LAST_MODIFIER` (last-ditch: events with no sender info at all,
+///      e.g. PowerShell-created appointments and unsent meeting drafts.
+///      For those the last modifier is the calendar owner, which is the
+///      semantically correct answer to "who organized this".)
+///
+/// Email values are dropped if they aren't SMTP — an X.500 string is worse
+/// than empty because it gets rendered to the user as the "Organizer".
+/// Names are kept as-is regardless of whether the paired email survives.
+fn resolve_organizer(
+    representing_name:  &str,
+    representing_email: &str,
+    sender_name:        &str,
+    sender_email:       &str,
+    last_modifier_name: &str,
+) -> (String, String) {
+    let pick = |primary: &str, fallback: &str| -> String {
+        if !primary.is_empty() { primary } else { fallback }.to_owned()
+    };
+
+    let name = {
+        let n = pick(representing_name, sender_name);
+        if n.is_empty() { last_modifier_name.to_owned() } else { n }
+    };
+    let email_raw = pick(representing_email, sender_email);
+    let email = if is_smtp_address(&email_raw) { email_raw } else { String::new() };
+    (name, email)
+}
+
+
+/// Heuristic: is this string a real SMTP address rather than an Exchange
+/// X.500 / legacy EX form? We don't validate against RFC 5322 — we only
+/// need to distinguish `alice@example.com` from
+/// `/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=…`.
+fn is_smtp_address(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() { return false; }
+    if s.starts_with('/') { return false; } // X.500 / DN form
+    let Some((local, domain)) = s.split_once('@') else { return false; };
+    !local.is_empty() && domain.contains('.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PR_SENDER_*` is empty on appointments the user created themselves.
+    /// Without the representing fallback, the organizer prefix never appears
+    /// on those events even though the rest of the event syncs fine.
+    #[test]
+    fn resolve_organizer_uses_representing_when_sender_empty() {
+        let (name, email) = resolve_organizer(
+            "Alice Owner", "alice@example.com",
+            "", "",
+            "Alice Owner",
+        );
+        assert_eq!(name,  "Alice Owner");
+        assert_eq!(email, "alice@example.com");
+    }
+
+    /// Meetings sent by other people: both sets are populated and equal.
+    /// We just need to not regress on this case.
+    #[test]
+    fn resolve_organizer_prefers_representing_when_both_present() {
+        let (name, email) = resolve_organizer(
+            "Alice Repr", "alice@example.com",
+            "Alice Sender", "alice@example.com",
+            "Owner Name",
+        );
+        assert_eq!(name,  "Alice Repr");
+        assert_eq!(email, "alice@example.com");
+    }
+
+    /// Falls back to sender values when representing is missing — only
+    /// happens on stripped-down providers and very old Exchange profiles.
+    #[test]
+    fn resolve_organizer_falls_back_to_sender_when_representing_missing() {
+        let (name, email) = resolve_organizer(
+            "", "",
+            "Bob", "bob@example.com",
+            "Owner Name",
+        );
+        assert_eq!(name,  "Bob");
+        assert_eq!(email, "bob@example.com");
+    }
+
+    /// X.500 / Exchange "EX" addresses must be discarded — surfacing
+    /// `/o=ExchangeLabs/ou=…/cn=Recipients/cn=…` as the organizer email
+    /// is the bug the user reported. The display name is kept.
+    #[test]
+    fn resolve_organizer_drops_x500_addresses() {
+        let x500 = "/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)\
+                    /cn=Recipients/cn=abc123-alice";
+        let (name, email) = resolve_organizer(
+            "Alice Owner", x500,
+            "", "",
+            "Alice Owner",
+        );
+        assert_eq!(name,  "Alice Owner");
+        assert_eq!(email, "", "X.500 address must be dropped, not surfaced");
+
+        // SENDER X.500 with no representing values: still drop the email.
+        let (name, email) = resolve_organizer(
+            "", "",
+            "Alice Owner", x500,
+            "Alice Owner",
+        );
+        assert_eq!(name,  "Alice Owner");
+        assert_eq!(email, "");
+    }
+
+    /// All four sender fields empty: fall back to the last-modifier name.
+    /// This covers events created via PowerShell/scripts and unsent meeting
+    /// drafts — for those the last modifier IS the calendar owner.
+    #[test]
+    fn resolve_organizer_falls_back_to_last_modifier_when_all_else_empty() {
+        let (name, email) = resolve_organizer(
+            "", "",
+            "", "",
+            "Alice Owner",
+        );
+        assert_eq!(name,  "Alice Owner");
+        assert_eq!(email, "");
+    }
+
+    /// All five empty: emit empty pair so `build_description` skips the
+    /// organizer prefix entirely instead of rendering a stray "Organizer:" line.
+    #[test]
+    fn resolve_organizer_all_empty_returns_empty() {
+        let (name, email) = resolve_organizer("", "", "", "", "");
+        assert_eq!(name, "");
+        assert_eq!(email, "");
+    }
+
+    #[test]
+    fn is_smtp_address_recognises_real_addresses() {
+        assert!(is_smtp_address("alice@example.com"));
+        assert!(is_smtp_address("first.last+tag@sub.example.co.uk"));
+        assert!(!is_smtp_address(""));
+        assert!(!is_smtp_address("plainstring"));
+        assert!(!is_smtp_address("@nodomain.com"));
+        assert!(!is_smtp_address("nolocal@"));
+        assert!(!is_smtp_address("a@b"), "single-label domains aren't reachable from external SMTP");
+        assert!(!is_smtp_address("/o=ExchangeLabs/cn=Recipients/cn=abc"));
+    }
 }
