@@ -388,16 +388,28 @@ pub fn check_for_update(current_version: &str) -> Option<String> {
 /// version would misleadingly report "up to date" even though the cached
 /// production copy is stale. We compare against the installed version instead.
 ///
+/// Resolution order on a dev build:
+///   1. recorded installed clean tag (most reliable),
+///   2. base tag of a dev installed record (recovers from a polluted sidecar),
+///   3. base tag of the current dev string (no installed record at all).
+///
 /// Returns `Some(version_without_v)` if an update should be offered.
 fn decide_update(current: &str, installed: Option<&str>, latest: &str) -> Option<String> {
-    // Dev builds contain unpublished work — the running exe isn't the one
-    // the self-updater touches. Fall back to the recorded installed version;
-    // if there isn't one (user never launched the installed exe) we have no
-    // meaningful comparison, so stay silent.
-    let effective = if is_dev_build(current) {
-        match installed {
-            Some(v) if !is_dev_build(v) => v,
-            _ => return None,
+    let effective: &str = if is_dev_build(current) {
+        // Prefer a clean installed record; if that's missing or itself a dev
+        // string (can happen if a prior `cargo run --release` polluted the
+        // sidecar), drop down to the leading release tag of whichever string
+        // we have. The base tag still pins down a lower bound for what's on
+        // disk: `v1.1.0-dirty` means at least a v1.1.0-based binary, which
+        // is enough to surface `v1.1.1`.
+        if let Some(v) = installed.filter(|v| !is_dev_build(v)) {
+            v
+        } else if let Some(v) = installed.and_then(release_base) {
+            v
+        } else if let Some(v) = release_base(current) {
+            v
+        } else {
+            return None;
         }
     } else {
         current
@@ -411,6 +423,25 @@ fn decide_update(current: &str, installed: Option<&str>, latest: &str) -> Option
     } else {
         None
     }
+}
+
+/// Strip a git-describe dev suffix and return the leading release tag.
+///
+/// Returns `None` for the bare `dev` fallback or anything that doesn't start
+/// with a recognisable tag — those carry no comparison signal at all.
+/// ```text
+/// v1.0.8                  -> Some("v1.0.8")
+/// v1.0.8-dirty            -> Some("v1.0.8")
+/// v1.0.8-5-gabc1234       -> Some("v1.0.8")
+/// v1.0.8-5-gabc1234-dirty -> Some("v1.0.8")
+/// dev                     -> None
+/// ```
+fn release_base(version: &str) -> Option<&str> {
+    if version.is_empty() || version == "dev" {
+        return None;
+    }
+    let tag = version.split('-').next()?;
+    if tag.is_empty() { None } else { Some(tag) }
 }
 
 /// Path of the sidecar file recording the version of the installed exe.
@@ -431,6 +462,19 @@ pub fn read_installed_version() -> Option<String> {
 /// cached production copy is out of date.
 pub fn record_installed_version(version: &str) {
     let Some(path) = installed_version_path() else { return };
+    record_installed_version_at(&path, version);
+}
+
+/// Path-parameterised body of [`record_installed_version`], pulled out so the
+/// dev-string refusal is unit-testable without touching `%LOCALAPPDATA%`.
+///
+/// Refuses to write a dev string: otherwise a `cargo run --release` from a
+/// dirty tree would clobber the previously-recorded clean version, leaving
+/// the sidecar holding (e.g.) `v1.1.0-dirty` and disabling the update check
+/// for *every* subsequent dev run — exactly the case [`decide_update`] is
+/// meant to recover from.
+fn record_installed_version_at(path: &std::path::Path, version: &str) {
+    if is_dev_build(version) { return; }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -537,17 +581,6 @@ mod tests {
         assert!(!is_dev_build("v1.0.8-rc.1"),        "pre-release tag with dot");
     }
 
-    /// Dev builds with no recorded installed version stay silent: nothing
-    /// actionable to report (the running exe isn't what would get updated,
-    /// and there's no production copy on this machine to compare against).
-    #[test]
-    fn decide_update_silent_for_dev_build_without_installed_record() {
-        assert_eq!(decide_update("v1.0.7-3-gabc",     None, "v1.0.8"), None);
-        assert_eq!(decide_update("v1.0.8-1-g1342d9d", None, "v1.0.9"), None);
-        assert_eq!(decide_update("v1.0.8-dirty",      None, "v1.0.9"), None);
-        assert_eq!(decide_update("dev",               None, "v1.0.8"), None);
-    }
-
     /// The regression that motivated this round: developer runs the dev
     /// build from `cargo run` and the production copy in %LOCALAPPDATA% is
     /// stale. Check-for-updates must surface the update so they know to
@@ -566,14 +599,84 @@ mod tests {
         );
     }
 
-    /// Pathological case: the sidecar somehow holds a dev string. Treat
-    /// it as "no useful record" rather than comparing dev-vs-latest.
+    /// Sidecar pollution case: a prior `cargo run --release` from a dirty
+    /// tree wrote a dev string into `.installed_version`. Earlier behaviour
+    /// gave up here and stayed silent — which left the user permanently
+    /// unable to see new releases until they ran the published exe again.
+    /// Now we recover by comparing against the leading release tag of the
+    /// dev string ("v1.1.0-dirty" → "v1.1.0").
     #[test]
-    fn decide_update_ignores_dev_installed_record() {
+    fn decide_update_recovers_from_dev_installed_record() {
+        // Dev current + dev installed: fall back to installed's base tag.
+        assert_eq!(
+            decide_update("v1.1.0-dirty", Some("v1.1.0-dirty"), "v1.1.1"),
+            Some("1.1.1".into()),
+            "polluted sidecar must not silently disable update check",
+        );
+        // Same shape with the commits-past-tag dev string.
         assert_eq!(
             decide_update("v1.0.9-1-gabc", Some("v1.0.8-dirty"), "v1.0.9"),
+            Some("1.0.9".into()),
+        );
+        // If the latest is the same as the installed base tag, stay silent.
+        assert_eq!(
+            decide_update("v1.1.0-dirty", Some("v1.1.0-dirty"), "v1.1.0"),
             None,
         );
+    }
+
+    /// No installed record at all: still surface newer releases by comparing
+    /// against the *current* dev build's base tag. A user running `cargo run`
+    /// on a fresh checkout has no sidecar (the installed exe never ran on
+    /// this machine) but they can still meaningfully be told "v1.1.1 is out".
+    #[test]
+    fn decide_update_uses_current_base_tag_when_no_installed_record() {
+        assert_eq!(
+            decide_update("v1.1.0-dirty", None, "v1.1.1"),
+            Some("1.1.1".into()),
+        );
+        assert_eq!(
+            decide_update("v1.0.8-5-gabc1234", None, "v1.0.9"),
+            Some("1.0.9".into()),
+        );
+        // `dev` fallback has no parseable tag → must stay silent.
+        assert_eq!(decide_update("dev", None, "v1.0.1"), None);
+        // Current's base equals latest → silent.
+        assert_eq!(decide_update("v1.1.1-dirty", None, "v1.1.1"), None);
+    }
+
+    /// `record_installed_version_at` must refuse to overwrite the sidecar
+    /// with a dev string. A dirty-release run earlier in the day must not
+    /// permanently disable the update prompt for every later dev run.
+    #[test]
+    fn record_installed_version_refuses_dev_strings() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ruscal-installed-version-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Seed with a clean version, then attempt to clobber with dev ones.
+        std::fs::write(&tmp, "v1.0.8").unwrap();
+
+        for dev in ["v1.1.0-dirty", "v1.0.8-5-gabc1234", "v1.0.8-5-gabc-dirty", "dev"] {
+            super::record_installed_version_at(&tmp, dev);
+            assert_eq!(
+                std::fs::read_to_string(&tmp).unwrap(),
+                "v1.0.8",
+                "dev string {dev:?} must not overwrite a recorded clean version",
+            );
+        }
+
+        // A real release tag, however, must overwrite.
+        super::record_installed_version_at(&tmp, "v1.1.1");
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "v1.1.1");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
