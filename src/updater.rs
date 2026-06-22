@@ -117,67 +117,189 @@ pub fn ensure_start_menu_shortcut() {
     write_start_menu_shortcut(&lnk, &target);
 }
 
-/// Spawn PowerShell to materialise the `.lnk`. We use the shell's scripting
-/// host because the only alternative is the `IShellLinkW` COM dance (several
-/// hundred lines of `windows` crate boilerplate for a one-shot write). Paths
-/// are quoted as PowerShell single-quoted strings (`'` doubled for escape).
+/// Materialise the `.lnk` via `IShellLinkW` + `IPersistFile::Save`.
+///
+/// Earlier versions spawned `powershell.exe` with a `WScript.Shell` script.
+/// Defender's ML classifier flagged the combination "GUI exe in
+/// %LOCALAPPDATA% spawns PowerShell to create a Start-menu shortcut +
+/// `HKCU\…\Run` autostart" as `Trojan:Win32/Bearfoos.A!ml`. The native
+/// COM path produces an identical `.lnk` without the heuristic load.
 fn write_start_menu_shortcut(lnk: &std::path::Path, target: &std::path::Path) {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::{Interface, PCWSTR};
+
     if let Some(parent) = lnk.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let q = |p: &std::path::Path| p.to_string_lossy().replace('\'', "''");
-    let lnk_q    = q(lnk);
-    let target_q = q(target);
-    let working  = target.parent().unwrap_or(target);
-    let working_q = q(working);
 
-    let script = format!(
-        "$s = New-Object -ComObject WScript.Shell; \
-         $l = $s.CreateShortcut('{lnk_q}'); \
-         $l.TargetPath = '{target_q}'; \
-         $l.WorkingDirectory = '{working_q}'; \
-         $l.IconLocation = '{target_q},0'; \
-         $l.Description = 'ruscal — Outlook to Google Calendar sync'; \
-         $l.Save()"
-    );
+    let working = target.parent().unwrap_or(target);
+    let target_w:  Vec<u16> = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let working_w: Vec<u16> = working.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let lnk_w:     Vec<u16> = lnk.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let descr_w:   Vec<u16> = "ruscal — Outlook to Google Calendar sync"
+        .encode_utf16().chain(std::iter::once(0)).collect();
+    let icon_w: Vec<u16> = {
+        let mut s: Vec<u16> = target.as_os_str().encode_wide().collect();
+        s.extend(",0\0".encode_utf16());
+        s
+    };
 
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    hide_console_window(&mut cmd);
-    let _ = cmd.output();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let result = (|| -> windows::core::Result<()> {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(PCWSTR(target_w.as_ptr()))?;
+            link.SetWorkingDirectory(PCWSTR(working_w.as_ptr()))?;
+            link.SetIconLocation(PCWSTR(icon_w.as_ptr()), 0)?;
+            link.SetDescription(PCWSTR(descr_w.as_ptr()))?;
+            let persist: IPersistFile = link.cast()?;
+            persist.Save(PCWSTR(lnk_w.as_ptr()), true)?;
+            Ok(())
+        })();
+        CoUninitialize();
+        if let Err(e) = result {
+            log::warn!("write_start_menu_shortcut failed: {e}");
+        }
+    }
 }
 
+use std::os::windows::ffi::OsStrExt;
+
 /// Kill the process (if any) whose image path equals `path`.
+///
+/// Walks the system process snapshot via `CreateToolhelp32Snapshot`, calls
+/// `QueryFullProcessImageNameW` on each, and `TerminateProcess` on matches.
+/// Native replacement for the earlier `Get-Process | Stop-Process` PowerShell
+/// pipeline (which contributed to a Defender ML false-positive).
 fn terminate_at_path(path: &std::path::Path) {
-    // Escape single-quotes for PowerShell single-quoted string.
-    let path_str = path.to_string_lossy().replace('\'', "''");
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &format!(
-            "Get-Process | Where-Object {{ $_.Path -eq '{path_str}' }} | Stop-Process -Force"
-        ),
-    ]);
-    hide_console_window(&mut cmd);
-    let _ = cmd.output();
-    // Wait for the process to fully release file locks before we copy over it.
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+        PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_NAME_FORMAT,
+    };
+
+    let target = path.to_string_lossy();
+    let target_lower = target.to_ascii_lowercase();
+
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return };
+        let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut entry).is_ok();
+        while ok {
+            let pid = entry.th32ProcessID;
+            if pid != 0 {
+                if let Ok(proc) = OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                    false, pid,
+                ) {
+                    let proc: HANDLE = proc;
+                    let mut buf = [0u16; 32_768];
+                    let mut len = buf.len() as u32;
+                    if QueryFullProcessImageNameW(
+                        proc, PROCESS_NAME_FORMAT(0),
+                        windows::core::PWSTR(buf.as_mut_ptr()), &mut len,
+                    ).is_ok() {
+                        let image = String::from_utf16_lossy(&buf[..len as usize]);
+                        if image.to_ascii_lowercase() == target_lower {
+                            let _ = TerminateProcess(proc, 1);
+                        }
+                    }
+                    let _ = CloseHandle(proc);
+                }
+            }
+            ok = Process32NextW(snap, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    // Wait for the killed process to fully release file locks before we
+    // copy over it.
     std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
-/// Mark a `Command` so Windows does not allocate a console window for it.
+/// Copy `text` onto the system clipboard as `CF_UNICODETEXT`.
 ///
-/// ruscal is compiled with `windows_subsystem = "windows"` — it has no
-/// attached console. When such a GUI process spawns a console-subsystem
-/// child (powershell is one), Windows allocates a *new* console for the
-/// child. That window pops visibly on the user's screen and lingers for
-/// the child's lifetime. `CREATE_NO_WINDOW` suppresses it. Dialog windows
-/// raised *from* the child (e.g. `OpenFileDialog`) still appear normally.
-#[cfg(target_os = "windows")]
-pub fn hide_console_window(cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+/// Native replacement for the earlier `powershell.exe -Command Set-Clipboard`
+/// spawn. Same heuristic-reduction motivation as the other native helpers
+/// in this module — see `write_start_menu_shortcut`.
+pub fn set_clipboard_text(text: &str) {
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = wide.len() * 2;
+
+    unsafe {
+        if OpenClipboard(HWND::default()).is_err() { return; }
+        let _ = EmptyClipboard();
+
+        let Ok(hmem): windows::core::Result<HGLOBAL> = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+            let _ = CloseClipboard();
+            return;
+        };
+        let dst = GlobalLock(hmem) as *mut u16;
+        if !dst.is_null() {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+            let _ = GlobalUnlock(hmem);
+            let _ = SetClipboardData(u32::from(CF_UNICODETEXT.0), HANDLE(hmem.0));
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+/// Show a system Open-File dialog filtered to `*.exe`, return the chosen
+/// path. Native `IFileOpenDialog` replacement for the earlier
+/// `powershell.exe ... System.Windows.Forms.OpenFileDialog` spawn.
+pub fn pick_exe_path(title: &str) -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize,
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, IShellItem, SIGDN_FILESYSPATH,
+    };
+    use windows::core::PCWSTR;
+
+    let title_w:  Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let label_w:  Vec<u16> = "Executables (*.exe)\0".encode_utf16().collect();
+    let spec_w:   Vec<u16> = "*.exe\0".encode_utf16().collect();
+
+    let mut result: Option<std::path::PathBuf> = None;
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _ = (|| -> windows::core::Result<()> {
+            let dlg: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            let filter = [COMDLG_FILTERSPEC {
+                pszName: PCWSTR(label_w.as_ptr()),
+                pszSpec: PCWSTR(spec_w.as_ptr()),
+            }];
+            dlg.SetFileTypes(&filter)?;
+            dlg.SetTitle(PCWSTR(title_w.as_ptr()))?;
+            if dlg.Show(None).is_ok() {
+                let item: IShellItem = dlg.GetResult()?;
+                let pwstr = item.GetDisplayName(SIGDN_FILESYSPATH)?;
+                let s = pwstr.to_string()?;
+                windows::Win32::System::Com::CoTaskMemFree(Some(pwstr.0 as *const _));
+                result = Some(std::path::PathBuf::from(s));
+            }
+            Ok(())
+        })();
+        CoUninitialize();
+    }
+    result
 }
 
 // ── Single-instance guard ─────────────────────────────────────────────────────

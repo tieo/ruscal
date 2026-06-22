@@ -1168,27 +1168,15 @@ fn main() {
         let weak = panel.as_weak();
         let browser_path = browser_path.clone();
         move || {
-            // Open a file picker via PowerShell to select an exe.
-            let mut cmd = std::process::Command::new("powershell");
-            cmd.args(["-NoProfile", "-NonInteractive", "-Command",
-                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; \
-                 $d = New-Object System.Windows.Forms.OpenFileDialog; \
-                 $d.Filter = 'Executables (*.exe)|*.exe'; \
-                 $d.Title = 'Select browser'; \
-                 if ($d.ShowDialog() -eq 'OK') { $d.FileName }"]);
-            updater::hide_console_window(&mut cmd);
-            let result = cmd.output();
-            if let Ok(out) = result {
-                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !path.is_empty() {
-                    *browser_path.lock().unwrap() = Some(path.clone());
-                    let mut cfg = load_config();
-                    cfg.browser_path = Some(path.clone());
-                    let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&cfg).unwrap_or_default());
-                    if let Some(p) = weak.upgrade() {
-                        p.set_browser_path(path.into());
-                    }
-                }
+            let Some(picked) = updater::pick_exe_path("Select browser") else { return };
+            let path = picked.to_string_lossy().to_string();
+            if path.is_empty() { return; }
+            *browser_path.lock().unwrap() = Some(path.clone());
+            let mut cfg = load_config();
+            cfg.browser_path = Some(path.clone());
+            let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&cfg).unwrap_or_default());
+            if let Some(p) = weak.upgrade() {
+                p.set_browser_path(path.into());
             }
         }
     });
@@ -1235,12 +1223,7 @@ fn main() {
             let Some(p) = weak.upgrade() else { return };
             let text = p.get_sync_error_detail().to_string();
             if text.is_empty() { return; }
-            let escaped = text.replace('\'', "''");
-            let mut cmd = std::process::Command::new("powershell");
-            cmd.args(["-NoProfile", "-NonInteractive", "-Command",
-                      &format!("Set-Clipboard -Value '{escaped}'")]);
-            updater::hide_console_window(&mut cmd);
-            let _ = cmd.output();
+            updater::set_clipboard_text(&text);
             p.set_error_copy_done(true);
             let weak2 = weak.clone();
             slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
