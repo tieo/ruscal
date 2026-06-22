@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  # Required by signpath/github-action-submit-signing-request to fetch the
+  # workflow run's unsigned artifact via GitHub's REST API.
+  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -14,6 +17,8 @@ env:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      unsigned-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
 
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +46,62 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      - name: Stage unsigned artifact for SignPath upload
+        shell: bash
+        run: |
+          mkdir -p artifact-unsigned
+          cp target/x86_64-pc-windows-msvc/release/ruscal.exe artifact-unsigned/ruscal.exe
+
+      - name: Upload unsigned artifact
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruscal-unsigned
+          path: artifact-unsigned/ruscal.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Submit signing request to SignPath Foundation
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ vars.SIGNPATH_ORG_ID }}'
+          project-slug: 'ruscal'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'ruscal-exe'
+          github-artifact-id: '${{ needs.build.outputs.unsigned-artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed'
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruscal-signed
+          path: signed/ruscal.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download signed artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ruscal-signed
+          path: signed
+
       - name: Generate changelog
         id: changelog
         shell: bash
@@ -62,4 +123,4 @@ jobs:
           body: ${{ steps.changelog.outputs.BODY }}
           draft: false
           prerelease: false
-          files: target/x86_64-pc-windows-msvc/release/ruscal.exe
+          files: signed/ruscal.exe
