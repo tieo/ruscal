@@ -549,13 +549,14 @@ fn main() {
 
         // Self-heal a stale autostart entry from earlier versions that wrote
         // `target/debug/ruscal.exe` on first-run — that's a console-subsystem
-        // binary and pops a terminal at logon.
+        // binary and pops a terminal at logon. Only fires if the user already
+        // opted into autostart; never re-creates a deleted entry.
         repair_autostart();
 
-        // Existing installs from before the Start-menu integration shipped
-        // don't have a `.lnk` in Programs; create one so ruscal appears in
-        // Windows Search without waiting for another self-install cycle.
-        updater::ensure_start_menu_shortcut();
+        // `.lnk` creation now lives only inside `self_install` — runs once
+        // per fresh install rather than on every launch. Reduces the
+        // dropper-shaped runtime behaviour Defender ML weights (Start-menu
+        // shortcut write from a GUI exe in `%LOCALAPPDATA%`).
     }
 
     unsafe {
@@ -597,8 +598,10 @@ fn main() {
     let browser_path: Arc<Mutex<Option<String>>> =
         Arc::new(Mutex::new(config.browser_path.clone()));
 
-    // Enable "Start with Windows" by default on first run.
-    if first_run { set_autostart(true); }
+    // Autostart is opt-in: user toggles "Start with Windows" in settings.
+    // Earlier versions enabled it automatically on first run, which paired
+    // with the Start-menu `.lnk` to form the classic `Trojan:Win32/Bearfoos`
+    // persistence pattern Defender ML weights heavily.
     let interval_secs: Rc<std::cell::Cell<u64>> =
         Rc::new(std::cell::Cell::new(config.sync_interval_minutes.max(1) * 60));
 
