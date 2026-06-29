@@ -97,8 +97,11 @@ jobs:
     needs: build
     runs-on: windows-latest
     if: ${{ !contains(github.ref_name, '-') }}  # skip pre-release tags
+    env:
+      GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
     steps:
       - name: Submit WinGet manifest update
+        id: winget
         uses: vedantmgoyal2009/winget-releaser@v2
         with:
           identifier: tieo.ruscal
@@ -109,3 +112,43 @@ jobs:
           # `tieo/winget-pkgs` (the existing fork of microsoft/winget-pkgs).
           # Stored as a repo secret — see docs/SIGNING.md for setup notes.
           token: ${{ secrets.WINGET_TOKEN }}
+
+      - name: Patch manifest Architecture to x64
+        # komac (the tool inside winget-releaser) inspects the installer's
+        # PE header to determine architecture. Inno Setup compiles a
+        # *32-bit* bootstrapper exe by default — even when the payload is
+        # 64-bit — so komac records `Architecture: x86` and the
+        # winget-pkgs validator then complains the new manifest is
+        # "missing the x64 installer" that prior versions had. Patch the
+        # manifest in place on the PR branch.
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -e
+          ver="${VERSION#v}"
+          # Find the PR that winget-releaser just opened. Latest open PR
+          # by this account against microsoft/winget-pkgs for this version.
+          pr_branch=$(gh pr list --repo microsoft/winget-pkgs --author tieo --state open \
+            --search "tieo.ruscal $ver in:title" \
+            --json headRefName -q '.[0].headRefName')
+          if [ -z "$pr_branch" ]; then
+            echo "no winget-releaser PR found — nothing to patch"; exit 0
+          fi
+          echo "patching branch: $pr_branch"
+          path="manifests/t/tieo/ruscal/$ver/tieo.ruscal.installer.yaml"
+          gh api "repos/tieo/winget-pkgs/contents/$path?ref=$pr_branch" -q '.content' \
+            | base64 -d > installer.yaml
+          if grep -q "Architecture: x86" installer.yaml; then
+            sed -i 's/Architecture: x86/Architecture: x64/' installer.yaml
+            sha=$(gh api "repos/tieo/winget-pkgs/contents/$path?ref=$pr_branch" -q '.sha')
+            content=$(base64 -w0 installer.yaml)
+            gh api -X PUT "repos/tieo/winget-pkgs/contents/$path" \
+              -f "branch=$pr_branch" \
+              -f "message=Architecture: x64 (Inno bootstrapper is 32-bit; payload is x64)" \
+              -f "sha=$sha" \
+              -f "content=$content"
+            echo "architecture patched"
+          else
+            echo "no x86 architecture to patch (already x64?)"
+          fi
