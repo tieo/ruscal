@@ -41,6 +41,25 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          # Inno Setup 6 is preinstalled on windows-latest runners under
+          # C:\Program Files (x86)\Inno Setup 6\. Compile in-place; output
+          # lands next to the .iss file as `ruscal-setup.exe`.
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not found at $iscc; installing via choco"
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DMyAppVersion=$version" installer\ruscal.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit $LASTEXITCODE" }
+          # Surface the produced installer next to the bare exe so the
+          # release step can attach both.
+          Move-Item installer\Output\ruscal-setup.exe .
+          Get-FileHash -Algorithm SHA256 ruscal-setup.exe
+
       - name: Generate changelog
         id: changelog
         shell: bash
@@ -62,4 +81,9 @@ jobs:
           body: ${{ steps.changelog.outputs.BODY }}
           draft: false
           prerelease: false
-          files: target/x86_64-pc-windows-msvc/release/ruscal.exe
+          # Ship both: the Inno installer (winget-pkgs target, Start-menu
+          # shortcut, Apps & Features entry) and the bare exe (portable
+          # users / advanced installs / scripted environments).
+          files: |
+            ruscal-setup.exe
+            target/x86_64-pc-windows-msvc/release/ruscal.exe

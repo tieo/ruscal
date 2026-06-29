@@ -445,8 +445,10 @@ export component TrayPanel inherits Window {
 
     // Page 4 — Settings
     in-out property <int>  sync-interval-minutes: 15;
+    in-out property <bool> start-with-windows: false;
     in-out property <bool> start-minimized: true;
     callback settings-interval-changed(int);
+    callback settings-startup-changed(bool);
     callback settings-start-minimized-changed(bool);
     callback add-google-account();          // add a new account from settings
     callback remove-google-account(string); // remove a connected account
@@ -989,6 +991,34 @@ export component TrayPanel inherits Window {
                     VerticalLayout {
                         padding: 20px;
                         spacing: 0px;
+
+                        // ── Start with Windows ────────────────────────────────
+                        HorizontalLayout {
+                            padding-top: 4px;
+                            padding-bottom: 16px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 3px;
+                                Text {
+                                    text: "Start with Windows";
+                                    color: Theme.text-primary;
+                                    font-size: 13px; font-weight: 600;
+                                }
+                                Text {
+                                    text: "Launch ruscal automatically when you log in";
+                                    color: Theme.text-secondary;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            SettingsToggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: start-with-windows;
+                                toggled(v) => { root.settings-startup-changed(v); }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Theme.border; }
 
                         // ── Start minimized ───────────────────────────────────
                         HorizontalLayout {

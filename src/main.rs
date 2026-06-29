@@ -54,6 +54,79 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
+// ── Autostart (opt-in) ────────────────────────────────────────────────────────
+//
+// `set_autostart` only ever fires from the in-app "Start with Windows" toggle.
+// It is *not* invoked from any install / first-run path, so the registry write
+// only happens after an explicit user click. That keeps the Bearfoos-shaped
+// pattern (`HKCU\…\Run` + GUI exe in user-writable path) absent from the
+// install footprint and present only when the user has consented.
+
+const AUTOSTART_KEY:   &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+const AUTOSTART_VALUE: &str = "ruscal";
+
+fn get_autostart() -> bool {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE,
+    };
+    use windows::core::PCWSTR;
+    let key_path: Vec<u16> = format!("{AUTOSTART_KEY}\0").encode_utf16().collect();
+    let val_name: Vec<u16> = format!("{AUTOSTART_VALUE}\0").encode_utf16().collect();
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR::from_raw(key_path.as_ptr()),
+                         0, KEY_READ, &mut key).is_err() {
+            return false;
+        }
+        let mut size = 0u32;
+        let mut _kind = REG_VALUE_TYPE::default();
+        let found = RegQueryValueExW(key, PCWSTR::from_raw(val_name.as_ptr()),
+                                     None, Some(&mut _kind), None, Some(&mut size)).is_ok();
+        let _ = RegCloseKey(key);
+        found
+    }
+}
+
+fn set_autostart(enable: bool) {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegSetValueExW, RegDeleteValueW,
+        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ,
+    };
+    use windows::core::PCWSTR;
+    let key_path: Vec<u16> = format!("{AUTOSTART_KEY}\0").encode_utf16().collect();
+    let val_name: Vec<u16> = format!("{AUTOSTART_VALUE}\0").encode_utf16().collect();
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR::from_raw(key_path.as_ptr()),
+                         0, KEY_WRITE, &mut key).is_err() {
+            return;
+        }
+        if enable {
+            // Register the currently-running exe. Inno installs to
+            // `%LOCALAPPDATA%\Programs\ruscal\ruscal.exe`, so `current_exe()`
+            // resolves to a stable, owned-by-user location with no admin
+            // requirements — distinct from the old `%LOCALAPPDATA%\ruscal\`
+            // path that anchored the Bearfoos heuristic.
+            if let Ok(exe) = std::env::current_exe() {
+                // Quote the path so spaces in the install dir don't break
+                // Windows' logon-time command parser.
+                let quoted = format!("\"{}\"\0", exe.display());
+                let path_str: Vec<u16> = quoted.encode_utf16().collect();
+                let bytes = std::slice::from_raw_parts(
+                    path_str.as_ptr() as *const u8,
+                    path_str.len() * 2,
+                );
+                let _ = RegSetValueExW(key, PCWSTR::from_raw(val_name.as_ptr()),
+                                       0, REG_SZ, Some(bytes));
+            }
+        } else {
+            let _ = RegDeleteValueW(key, PCWSTR::from_raw(val_name.as_ptr()));
+        }
+        let _ = RegCloseKey(key);
+    }
+}
+
 // ── Persistence ───────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
@@ -465,6 +538,7 @@ fn main() {
     panel.set_pairs(pairs_model.clone().into());
     panel.set_sync_status(SyncStatus::Idle);
     panel.set_sync_interval_minutes(config.sync_interval_minutes.max(1) as i32);
+    panel.set_start_with_windows(get_autostart());
     panel.set_start_minimized(start_minimized_effective(&config));
     panel.set_browser_path(config.browser_path.clone().unwrap_or_default().into());
 
@@ -1104,6 +1178,10 @@ fn main() {
                 },
             );
         }
+    });
+
+    panel.on_settings_startup_changed(|enable| {
+        set_autostart(enable);
     });
 
     panel.on_settings_start_minimized_changed(|enable| {
