@@ -1,111 +1,50 @@
-# Code Signing & Defender False-Positive Workflow
+# Code Signing — current status
 
-`ruscal` was flagged as `Trojan:Win32/Bearfoos.A!ml` by Defender's cloud ML
-classifier on 2026-06-21. `!ml` means the classifier matched a behavioural
-*pattern*, not a known signature. The triggering pattern was the combination
-of:
+`ruscal` ships **unsigned**. Microsoft Defender's cloud ML classifier has
+been observed flagging the binary as `Trojan:Win32/Bearfoos.A!ml` — a
+heuristic-only label assigned to "looks like a dropper" patterns. The fix
+is a real Authenticode signature anchored to a publisher identity.
 
-1. A GUI exe living in `%LOCALAPPDATA%`.
-2. An `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ruscal` autostart
-   key.
-3. A Start-menu `.lnk` pointing into `%LOCALAPPDATA%`.
-4. Unsigned PE.
+## Free signing paths surveyed (2026)
 
-(1), (2), (3) are intrinsic to the product — that's how ruscal installs and
-starts. The only mitigation is to **anchor the binary's identity** with an
-Authenticode signature so Defender stops evaluating it on heuristic alone.
+| programme | status | usable now? |
+|---|---|---|
+| SignPath Foundation OSS | declined — project not popular enough yet | no, reapply once usage grows |
+| OSSign (ossign.org) | applications suspended due to backlog | no, watch for queue reopening |
+| Certum free OSS cert | discontinued in 2016 | no |
+| Sectigo / Comodo free OSS cert | discontinued | no |
+| Microsoft Trusted Signing | ~$10/month Azure | paid, not free |
+| Certum paid OSS cert | ~€69 first year, €29/yr renewal | paid, not free |
 
-A separate pre-existing trigger — the GUI exe spawning `powershell.exe` for
-shortcut creation, clipboard, and process termination — has been removed in
-commit `af2a2b2`. All those operations now use native Win32 calls.
+No free Authenticode signing path is currently open. Until that changes
+`ruscal` is distributed unsigned.
 
-## Path 1 — Sign every release via SignPath Foundation (free for OSS)
+## What this means for users
 
-The `release.yml` workflow already invokes
-`signpath/github-action-submit-signing-request@v1`. To turn it on you need a
-one-time SignPath Foundation enrolment:
+When you download `ruscal.exe` from the GitHub release page (or pull it
+through WinGet), Windows Defender may quarantine it as Bearfoos. If it
+does:
 
-### 1. Apply for the SignPath Foundation OSS plan
+1. Open Windows Security → Virus & threat protection → Protection history.
+2. Find the entry for `ruscal.exe`.
+3. Choose **Actions → Restore**, then **Allow on device**.
+4. Optional: submit the SHA-256 hash to
+   <https://www.microsoft.com/en-us/wdsi/filesubmission> as
+   "Software developer" → "Incorrect detection" so Microsoft adds it to
+   their cleared-hashes list.
 
-https://signpath.org/apply
+The build does not contain a real trojan. The source code is public at
+<https://github.com/tieo/ruscal>; the behaviours capa identifies (registry
+write under `HKCU\…\Run`, Start-menu shortcut creation, MAPI calls,
+clipboard write, TLS / OAuth crypto) are all needed by the app and
+explained in commit messages.
 
-Fill in the form:
+## When signing becomes possible again
 
-* **Project name:** `ruscal`
-* **Project URL:** `https://github.com/tieo/ruscal`
-* **License:** GPL-3.0 (or whatever `LICENSE` says — must match).
-* **Maintainer:** the GitHub account that owns the repo.
+The dev-side actions when a free signing path opens:
 
-SignPath replies in a few business days with an organisation ID, a signing
-policy slug, and an API token.
-
-### 2. Configure the SignPath project
-
-In the SignPath portal:
-
-* **Project slug:** `ruscal` (matches the workflow).
-* **Artifact configuration slug:** `ruscal-exe` (matches the workflow).
-  Artifact type = "Single file", expected file = `ruscal.exe`.
-* **Signing policy slug:** `release-signing` (matches the workflow).
-  Policy = "Release", trusted submitter = your GitHub repo `tieo/ruscal`,
-  branch/tag pattern = `refs/tags/v*`.
-
-### 3. Add GitHub secrets / variables
-
-In `https://github.com/tieo/ruscal/settings/secrets/actions`:
-
-| Kind     | Name                  | Value                                   |
-| -------- | --------------------- | --------------------------------------- |
-| Secret   | `SIGNPATH_API_TOKEN`  | The API token issued by SignPath.       |
-| Variable | `SIGNPATH_ORG_ID`     | The organisation ID issued by SignPath. |
-
-`SIGNPATH_ORG_ID` is non-sensitive (it's just a UUID) — set it as a
-*variable* not a *secret* so it shows up in workflow logs for debugging.
-
-### 4. Cut a release
-
-```bash
-git tag v1.2.0
-git push origin v1.2.0
-```
-
-The workflow builds the binary, uploads it as an unsigned artifact,
-SignPath fetches it, signs it, and the signed binary is published to the
-GitHub release. **Do not run any locally-built dev binary** until SignPath
-has signed at least one release — Defender will quarantine it again.
-
-### 5. First few releases: re-submit to WDSI per release
-
-Even with a valid signature, Defender's ML model needs a handful of
-"this signature is benign" data points before it stops flagging. For the
-first 2–3 signed releases:
-
-1. Download the signed `ruscal.exe` from the GitHub release.
-2. Submit to <https://www.microsoft.com/en-us/wdsi/filesubmission> as
-   "Software developer" → "Incorrect detection".
-3. Mention previous detection name (`Trojan:Win32/Bearfoos.A!ml`) in the
-   notes and that the binary is now Authenticode-signed via SignPath.
-4. MS clears the hash within 24–72h and re-trains the model.
-
-Once reputation builds, future releases auto-clear without further action.
-
-## Path 2 — Stay unsigned forever
-
-If SignPath signup fails for any reason, the fallback is per-release
-WDSI submission for every new `ruscal.exe` hash. Free, but tedious and
-no reputation accumulates because there's no publisher identity to
-attach reputation to.
-
-## SHA256 of the quarantined binary (for WDSI submission)
-
-The detection on 2026-06-21 21:03 was on
-`%LOCALAPPDATA%\ruscal\ruscal.exe` produced from commit `0957311`. To
-get the exact hash:
-
-```powershell
-Get-FileHash -Algorithm SHA256 -Path "$env:LOCALAPPDATA\ruscal\ruscal.exe"
-```
-
-(If Defender has already quarantined the file, restore via
-Windows Security → Protection history before hashing — or take the SHA256
-from the latest GitHub release asset, which has identical bytes.)
+1. Re-add a SignPath (or equivalent) signing job to `.github/workflows/release.yml`.
+2. Add `SIGNPATH_API_TOKEN` (secret) and `SIGNPATH_ORG_ID` (variable) — or
+   the equivalent for whichever programme accepts the project.
+3. Tag a release; first 2–3 signed builds may still need WDSI submissions
+   while Defender's model accumulates reputation against the certificate.

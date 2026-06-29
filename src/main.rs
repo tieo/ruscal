@@ -67,101 +67,6 @@ struct SavedPair {
 
 fn default_interval_minutes() -> u64 { 15 }
 
-// ── Autostart (Windows registry) ──────────────────────────────────────────────
-
-const AUTOSTART_VALUE: &str = "ruscal";
-const AUTOSTART_KEY: &str =
-    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
-
-fn get_autostart() -> bool {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
-        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE,
-    };
-    use windows::core::PCWSTR;
-    let key_path: Vec<u16> = format!("{AUTOSTART_KEY}\0").encode_utf16().collect();
-    let val_name: Vec<u16> = format!("{AUTOSTART_VALUE}\0").encode_utf16().collect();
-    unsafe {
-        let mut key = HKEY::default();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR::from_raw(key_path.as_ptr()),
-                         0, KEY_READ, &mut key).is_err() {
-            return false;
-        }
-        let mut size = 0u32;
-        let mut _kind = REG_VALUE_TYPE::default();
-        let found = RegQueryValueExW(key, PCWSTR::from_raw(val_name.as_ptr()),
-                                     None, Some(&mut _kind), None, Some(&mut size)).is_ok();
-        let _ = RegCloseKey(key);
-        found
-    }
-}
-
-/// Pick the path that should be written to the autostart registry entry.
-///
-/// The registry value must always point at the installed release binary
-/// (under `%LOCALAPPDATA%\ruscal\ruscal.exe`). Writing `current_exe()`
-/// verbatim is wrong during development — the debug target is a
-/// console-subsystem binary, which Windows launches at logon by popping
-/// a terminal window. Closing that terminal then kills ruscal (the
-/// console sends `CTRL_CLOSE_EVENT`). Returns `None` when there is no
-/// installed binary to register, in which case the caller must skip the
-/// write rather than leave a broken entry behind.
-fn pick_autostart_path(installed: Option<&std::path::Path>, installed_exists: bool)
-    -> Option<&std::path::Path>
-{
-    match installed {
-        Some(p) if installed_exists => Some(p),
-        _ => None,
-    }
-}
-
-fn set_autostart(enable: bool) {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegSetValueExW, RegDeleteValueW,
-        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ,
-    };
-    use windows::core::PCWSTR;
-    let key_path: Vec<u16> = format!("{AUTOSTART_KEY}\0").encode_utf16().collect();
-    let val_name: Vec<u16> = format!("{AUTOSTART_VALUE}\0").encode_utf16().collect();
-    unsafe {
-        let mut key = HKEY::default();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR::from_raw(key_path.as_ptr()),
-                         0, KEY_WRITE, &mut key).is_err() {
-            return;
-        }
-        if enable {
-            let installed = updater::installed_path();
-            let exists    = installed.as_deref().map(|p| p.exists()).unwrap_or(false);
-            if let Some(exe) = pick_autostart_path(installed.as_deref(), exists) {
-                let path_str: Vec<u16> = format!("{}\0", exe.display()).encode_utf16().collect();
-                let bytes =
-                    std::slice::from_raw_parts(path_str.as_ptr() as *const u8, path_str.len() * 2);
-                let _ = RegSetValueExW(key, PCWSTR::from_raw(val_name.as_ptr()),
-                                       0, REG_SZ, Some(bytes));
-            } else {
-                log::warn!(
-                    "set_autostart: no installed binary on disk — refusing to register \
-                     a startup entry (would otherwise point at a dev target)"
-                );
-            }
-        } else {
-            let _ = RegDeleteValueW(key, PCWSTR::from_raw(val_name.as_ptr()));
-        }
-        let _ = RegCloseKey(key);
-    }
-}
-
-/// Overwrite the autostart registry value with the installed binary path
-/// whenever the entry exists. Self-heals users whose registry still points
-/// at `target/debug/ruscal.exe` from an earlier version that used
-/// `current_exe()` at first-run. Idempotent: a no-op once the value is
-/// already correct (Windows treats identical writes as a single update).
-fn repair_autostart() {
-    if get_autostart() {
-        set_autostart(true);
-    }
-}
-
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct AppConfig {
     pairs:          Vec<SavedPair>,
@@ -448,40 +353,6 @@ mod tests {
         assert!(out.starts_with("Sync error"), "got: {out}");
     }
 
-    // ── Autostart path picker ────────────────────────────────────────────────
-    //
-    // Regression guard: before this test, `set_autostart(true)` wrote
-    // `current_exe()` into `HKCU\...\Run`. On a dev machine that resolved to
-    // `target\debug\ruscal.exe`, a console-subsystem binary that pops a
-    // terminal window at logon and closes the app when that terminal is
-    // closed. The pure helper must *never* hand out that path — the registry
-    // entry has to point at the installed release binary or nothing at all.
-
-    use super::pick_autostart_path;
-    use std::path::PathBuf;
-
-    #[test]
-    fn autostart_picks_installed_path_when_it_exists() {
-        let installed = PathBuf::from(r"C:\Users\x\AppData\Local\ruscal\ruscal.exe");
-        let picked = pick_autostart_path(Some(installed.as_path()), true);
-        assert_eq!(picked, Some(installed.as_path()));
-    }
-
-    #[test]
-    fn autostart_refuses_when_installed_binary_missing() {
-        // A dev machine that never ran a release has no installed exe.
-        // Writing anything would either register a debug build (terminal at
-        // logon) or a bogus non-existent path — both worse than no entry.
-        let installed = PathBuf::from(r"C:\Users\x\AppData\Local\ruscal\ruscal.exe");
-        assert_eq!(pick_autostart_path(Some(installed.as_path()), false), None);
-    }
-
-    #[test]
-    fn autostart_refuses_when_install_path_undetermined() {
-        assert_eq!(pick_autostart_path(None, false), None);
-        assert_eq!(pick_autostart_path(None, true), None);
-    }
-
     // ── Settings cog toggle ────────────────────────────────────────────────
     //
     // The cog in the header is a single button and the user expects it to
@@ -507,19 +378,6 @@ mod tests {
 fn main() {
     env_logger::init();
 
-    let launch_args = updater::parse_args();
-    updater::cleanup_stale_update_exe();
-
-    // Self-install runs release-only: a `cargo run` dev loop must not stomp
-    // the installed production binary at %LOCALAPPDATA%\ruscal.
-    #[cfg(not(debug_assertions))]
-    if !updater::is_installed_path() {
-        let flag = launch_args.just_updated.as_deref()
-            .map(|v| format!("--just-updated={v}"))
-            .unwrap_or_else(|| "--just-installed".to_owned());
-        updater::self_install(Some(&flag)); // diverges — exits this process
-    }
-
     // Single-instance: if ruscal is already running, bring the existing
     // window to the front and quit this process. Standard Windows app
     // behavior — a second click on the shortcut must not respawn the app
@@ -539,25 +397,6 @@ fn main() {
             return;
         }
     };
-
-    #[cfg(not(debug_assertions))]
-    {
-        // Record the version of the installed (production) binary so a later
-        // `cargo run` from a dev build can still tell the user whether the
-        // cached copy in %LOCALAPPDATA% is out of date relative to GitHub.
-        updater::record_installed_version(APP_VERSION);
-
-        // Self-heal a stale autostart entry from earlier versions that wrote
-        // `target/debug/ruscal.exe` on first-run — that's a console-subsystem
-        // binary and pops a terminal at logon. Only fires if the user already
-        // opted into autostart; never re-creates a deleted entry.
-        repair_autostart();
-
-        // `.lnk` creation now lives only inside `self_install` — runs once
-        // per fresh install rather than on every launch. Reduces the
-        // dropper-shaped runtime behaviour Defender ML weights (Start-menu
-        // shortcut write from a GUI exe in `%LOCALAPPDATA%`).
-    }
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(
@@ -598,10 +437,6 @@ fn main() {
     let browser_path: Arc<Mutex<Option<String>>> =
         Arc::new(Mutex::new(config.browser_path.clone()));
 
-    // Autostart is opt-in: user toggles "Start with Windows" in settings.
-    // Earlier versions enabled it automatically on first run, which paired
-    // with the Start-menu `.lnk` to form the classic `Trojan:Win32/Bearfoos`
-    // persistence pattern Defender ML weights heavily.
     let interval_secs: Rc<std::cell::Cell<u64>> =
         Rc::new(std::cell::Cell::new(config.sync_interval_minutes.max(1) * 60));
 
@@ -630,7 +465,6 @@ fn main() {
     panel.set_pairs(pairs_model.clone().into());
     panel.set_sync_status(SyncStatus::Idle);
     panel.set_sync_interval_minutes(config.sync_interval_minutes.max(1) as i32);
-    panel.set_start_with_windows(get_autostart());
     panel.set_start_minimized(start_minimized_effective(&config));
     panel.set_browser_path(config.browser_path.clone().unwrap_or_default().into());
 
@@ -643,17 +477,6 @@ fn main() {
     panel.set_last_sync_text(
         status_text(*last_synced.lock().unwrap(), app_start, has_pairs, interval_secs.get()).into()
     );
-
-    // Override status line for first-run / post-update messages.
-    if launch_args.just_installed {
-        panel.set_last_sync_text(
-            "Installed · starts with Windows".into()
-        );
-    } else if launch_args.just_updated.is_some() {
-        panel.set_last_sync_text(
-            format!("Updated to {}", APP_VERSION).into()
-        );
-    }
 
     // ── Sync callback ─────────────────────────────────────────────────────────
 
@@ -1122,51 +945,6 @@ fn main() {
         }
     });
 
-    // ── Update callbacks ──────────────────────────────────────────────────────
-
-    panel.on_update_now({
-        let weak = panel.as_weak();
-        move || {
-            let Some(p) = weak.upgrade() else { return };
-            let version = p.get_update_version().to_string();
-            if version.is_empty() { return; }
-
-            p.set_update_version("".into());
-            p.set_last_sync_text(format!("Downloading v{version}…").into());
-
-            let weak2 = weak.clone();
-            std::thread::spawn(move || {
-                match updater::download_update(&version) {
-                    Ok(temp_path) => {
-                        // Spawn the downloaded exe — it self-installs (terminates us, copies itself).
-                        let flag = format!("--just-updated={}", APP_VERSION);
-                        if std::process::Command::new(&temp_path).arg(&flag).spawn().is_ok() {
-                            slint::invoke_from_event_loop(|| {
-                                slint::quit_event_loop().ok();
-                            }).ok();
-                        } else {
-                            slint::invoke_from_event_loop(move || {
-                                if let Some(p) = weak2.upgrade() {
-                                    p.set_last_sync_text("Update failed: could not launch installer".into());
-                                    p.set_update_version(version.into());
-                                }
-                            }).ok();
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Update download failed: {e}");
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(p) = weak2.upgrade() {
-                                p.set_last_sync_text(format!("Update failed: {e}").into());
-                                p.set_update_version(version.into());
-                            }
-                        }).ok();
-                    }
-                }
-            });
-        }
-    });
-
     panel.on_browse_for_browser({
         let weak = panel.as_weak();
         let browser_path = browser_path.clone();
@@ -1189,34 +967,6 @@ fn main() {
             let _ = std::process::Command::new("explorer")
                 .arg(dir.join("ruscal"))
                 .spawn();
-        }
-    });
-
-    panel.on_dismiss_notification({
-        let weak = panel.as_weak();
-        move || {
-            if let Some(p) = weak.upgrade() {
-                p.set_update_version("".into());
-            }
-        }
-    });
-
-    panel.on_check_for_update({
-        let weak = panel.as_weak();
-        move || {
-            let Some(p) = weak.upgrade() else { return };
-            p.set_checking_for_update(true);
-            let weak2 = weak.clone();
-            std::thread::spawn(move || {
-                let result = updater::check_for_update(APP_VERSION);
-                slint::invoke_from_event_loop(move || {
-                    let Some(p) = weak2.upgrade() else { return };
-                    p.set_checking_for_update(false);
-                    if let Some(version) = result {
-                        p.set_update_version(version.into());
-                    }
-                }).ok();
-            });
         }
     });
 
@@ -1264,31 +1014,12 @@ fn main() {
         })
     };
 
-    let force_show =
-        first_run
-        || launch_args.just_installed
-        || launch_args.just_updated.is_some();
-
-    if !force_show && start_minimized_effective(&config) {
+    // First run: surface the window so the user can configure pairs.
+    // Subsequent runs honour the "Start minimized" setting.
+    if !first_run && start_minimized_effective(&config) {
         let weak = panel.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
             if let Some(p) = weak.upgrade() { p.hide().ok(); }
-        });
-    }
-
-
-    // ── Background update check ────────────────────────────────────────────────
-
-    {
-        let weak = panel.as_weak();
-        std::thread::spawn(move || {
-            if let Some(version) = updater::check_for_update(APP_VERSION) {
-                slint::invoke_from_event_loop(move || {
-                    if let Some(p) = weak.upgrade() {
-                        p.set_update_version(version.into());
-                    }
-                }).ok();
-            }
         });
     }
 
@@ -1373,10 +1104,6 @@ fn main() {
                 },
             );
         }
-    });
-
-    panel.on_settings_startup_changed(|enable| {
-        set_autostart(enable);
     });
 
     panel.on_settings_start_minimized_changed(|enable| {
