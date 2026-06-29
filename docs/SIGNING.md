@@ -48,3 +48,18 @@ The dev-side actions when a free signing path opens:
    the equivalent for whichever programme accepts the project.
 3. Tag a release; first 2–3 signed builds may still need WDSI submissions
    while Defender's model accumulates reputation against the certificate.
+
+## Repo secrets the existing workflow expects
+
+`release.yml` is wired for an auto-WinGet-publish step
+(`vedantmgoyal2009/winget-releaser@v2`). It requires a single repo secret:
+
+* `WINGET_TOKEN` — a classic GitHub Personal Access Token, `public_repo`
+  scope (no other scopes needed). The action uses it to push a branch to
+  `tieo/winget-pkgs` (the existing fork of `microsoft/winget-pkgs`) and
+  open the manifest-update PR. Create at
+  <https://github.com/settings/tokens/new>, store under
+  Repo Settings → Secrets and variables → Actions → New repository secret.
+
+Without `WINGET_TOKEN` set, only the `winget` job in the workflow fails;
+the release itself still publishes.

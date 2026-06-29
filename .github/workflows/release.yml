@@ -75,6 +75,7 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
+        id: gh-release
         uses: softprops/action-gh-release@v2
         with:
           name: ruscal ${{ github.ref_name }}
@@ -87,3 +88,24 @@ jobs:
           files: |
             ruscal-setup.exe
             target/x86_64-pc-windows-msvc/release/ruscal.exe
+
+  winget:
+    # Auto-submit a `microsoft/winget-pkgs` PR for the new release.
+    # Runs after the release job so the installer asset exists and
+    # the SHA256 stamped into the manifest matches what users will
+    # actually download.
+    needs: build
+    runs-on: windows-latest
+    if: ${{ !contains(github.ref_name, '-') }}  # skip pre-release tags
+    steps:
+      - name: Submit WinGet manifest update
+        uses: vedantmgoyal2009/winget-releaser@v2
+        with:
+          identifier: tieo.ruscal
+          # Pick only the Inno installer — the bare ruscal.exe is for
+          # portable use and intentionally absent from the WinGet manifest.
+          installers-regex: 'ruscal-setup\.exe$'
+          # Classic PAT with `public_repo` scope, scoped to push to
+          # `tieo/winget-pkgs` (the existing fork of microsoft/winget-pkgs).
+          # Stored as a repo secret — see docs/SIGNING.md for setup notes.
+          token: ${{ secrets.WINGET_TOKEN }}

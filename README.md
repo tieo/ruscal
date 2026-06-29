@@ -5,10 +5,10 @@ Stops you from forgetting outlook calendar events by clearly showing them in *yo
 ## Install
 
 ```
-winget install ruscal
+winget install tieo.ruscal
 ```
 
-Updates: `winget upgrade ruscal`. There is no in-app updater.
+Updates: `winget upgrade tieo.ruscal`. There is no in-app updater.
 
 ## Heads up — Defender false positive
 
