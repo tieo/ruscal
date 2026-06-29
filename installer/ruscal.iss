@@ -44,6 +44,15 @@ WizardStyle=modern
 ; Show ruscal in Apps & Features.
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
+; Gracefully close a running ruscal before overwriting the exe. Without
+; this, `winget upgrade ruscal` (or any silent reinstall) fails because
+; the running tray app keeps an open handle on ruscal.exe. Inno scans
+; for processes matching `[Files]` source images via the `CloseApplicationsFilter`
+; default (.exe), prompts non-silent runs, terminates silent ones.
+CloseApplications=yes
+; Restart whatever Inno just closed after the install completes — so the
+; tray icon comes back automatically post-upgrade.
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
