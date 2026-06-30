@@ -2,6 +2,8 @@
 
 Stops you from forgetting outlook calendar events by clearly showing them in *your* calendar.
 
+Requires Outlook Classic; the new Outlook does not expose MAPI.
+
 ## Install
 
 ```
